@@ -26,8 +26,18 @@ static bool SafeReadablePtr(const void* ptr) {
 	return true;
 }
 
+static bool SafeExecutablePtr(const void* ptr) {
+	if (!ptr) return false;
+	MEMORY_BASIC_INFORMATION mbi{};
+	if (!VirtualQuery(ptr, &mbi, sizeof(mbi))) return false;
+	if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
+	const DWORD protection = mbi.Protect & 0xFF;
+	return protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ ||
+		protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
+}
+
 static bool SafeSqliteErrcode(sqlite3_api_routines* routines, LPVOID db, int& rc) {
-	if (!routines || !routines->errcode || !SafeReadablePtr(db))
+	if (!routines || !SafeExecutablePtr(reinterpret_cast<const void*>(routines->errcode)) || !SafeReadablePtr(db))
 		return false;
 	__try {
 		rc = routines->errcode(db);
@@ -69,12 +79,10 @@ namespace xmgr {
 		m_sqlite3Rountines = (sqlite3_api_routines*)(module_base + XWECHAT_SQLITE3_API_ROUTINES_OFFSET);
 		m_sqlcipherRountines = (sqlcipher_api_routines*)(module_base + XWECHAT_SQLCIPHER_API_ROUTINES_OFFSET);
 		m_codecGetKey = (sqlite3CodecGetKey)(module_base + XWECHAT_SQLITE3_CODEC_GET_KEY_FUNC);
-		LPVOID patchAddress = (LPVOID)((size_t)m_sqlite3Rountines->backup_init + 0xAD);
-		std::vector<BYTE> nopData(14, 0x90);
-		m_backupAsmCode.resize(nopData.size(), 0);
-		ReadProcessMemory(GetCurrentProcess(), patchAddress, m_backupAsmCode.data(), m_backupAsmCode.size(), nullptr);
-		WriteProcessMemory(GetCurrentProcess(), patchAddress, (LPCVOID)nopData.data(), nopData.size(), 0);
-		SetDbDebug("DatabaseMgr ctor ok");
+		// Do not patch backup_init here.  It is not needed for read-only
+		// contact/profile queries and a stale version-specific offset could
+		// modify arbitrary Weixin instructions during DLL initialization.
+		SetDbDebug(m_sqlite3Rountines ? "DatabaseMgr ctor ok" : "DatabaseMgr sqlite table unavailable");
 	}
 
 	DatabaseMgr::~DatabaseMgr() {
@@ -93,15 +101,40 @@ namespace xmgr {
 			rdata["desc"] = "input db handle is nullptr";
 			return rdata;
 		}
+		if (!SafeReadablePtr(m_sqlite3Rountines) ||
+			(!SafeExecutablePtr(reinterpret_cast<const void*>(m_sqlite3Rountines->prepare_v2)) &&
+			 !SafeExecutablePtr(reinterpret_cast<const void*>(m_sqlite3Rountines->prepare))) ||
+			!SafeExecutablePtr(reinterpret_cast<const void*>(m_sqlite3Rountines->step)) ||
+			!SafeExecutablePtr(reinterpret_cast<const void*>(m_sqlite3Rountines->finalize)) ||
+			!SafeExecutablePtr(reinterpret_cast<const void*>(m_sqlite3Rountines->column_count)) ||
+			!SafeExecutablePtr(reinterpret_cast<const void*>(m_sqlite3Rountines->column_name)) ||
+			!SafeExecutablePtr(reinterpret_cast<const void*>(m_sqlite3Rountines->column_type)) ||
+			!SafeExecutablePtr(reinterpret_cast<const void*>(m_sqlite3Rountines->column_blob)) ||
+			!SafeExecutablePtr(reinterpret_cast<const void*>(m_sqlite3Rountines->column_bytes))) {
+			rdata["status"] = -503;
+			rdata["desc"] = "sqlite API table unavailable for Weixin 4.1.10.27";
+			return rdata;
+		}
+		if (SafeExecutablePtr(reinterpret_cast<const void*>(m_sqlite3Rountines->busy_timeout))) {
+			// Contact/profile reads must not wait indefinitely behind a WeChat
+			// write transaction. The endpoint returns a structured error instead.
+			m_sqlite3Rountines->busy_timeout(db, 1000);
+		}
 		sqlite3_stmt* stmt = nullptr;
-		int rc = m_sqlite3Rountines->prepare((LPVOID)db, sql.c_str(), -1, &stmt, 0);
+		int rc = SQLITE_ERROR;
+		if (SafeExecutablePtr(reinterpret_cast<const void*>(m_sqlite3Rountines->prepare_v2)))
+			rc = m_sqlite3Rountines->prepare_v2((LPVOID)db, sql.c_str(), -1, &stmt, 0);
+		else
+			rc = m_sqlite3Rountines->prepare((LPVOID)db, sql.c_str(), -1, &stmt, 0);
 		if (rc != SQLITE_OK) {
 			rdata["status"] = rc;
 			rdata["desc"] = format_string("execute %s failed", "sqlite3_prepare");
 			return rdata;
 		}
 		nlohmann::ordered_json items = nlohmann::ordered_json::array();
-		while (m_sqlite3Rountines->step(stmt) == SQLITE_ROW)
+		int stepRc = SQLITE_DONE;
+		size_t rowCount = 0;
+		while ((stepRc = m_sqlite3Rountines->step(stmt)) == SQLITE_ROW)
 		{
 			int col_count = m_sqlite3Rountines->column_count(stmt);
 			nlohmann::ordered_json item;
@@ -134,8 +167,17 @@ namespace xmgr {
 				item[key] = value;
 			}
 			items.push_back(item);
+			if (++rowCount >= 1000) {
+				rdata["truncated"] = true;
+				break;
+			}
 		}
-		m_sqlite3Rountines->finalize(stmt);
+		if (stmt)
+			m_sqlite3Rountines->finalize(stmt);
+		if (stepRc != SQLITE_DONE && stepRc != SQLITE_ROW) {
+			rdata["status"] = stepRc;
+			rdata["desc"] = "sqlite3_step failed";
+		}
 		rdata["data"] = items;
 		return rdata;
 	}
@@ -243,42 +285,13 @@ namespace xmgr {
 			SetDbDebug("searchDatabases cached ok");
 			return m_dbs;
 		}
-		std::vector<LPVOID> results;
-		size_t vfs_addr = (size_t)g_hWeixinDll + XWECHAT_SQLITE3_VFS_OFFSET;
-		SetDbDebug2("searchDatabases scan pattern", vfs_addr);
-		ScanPattern(GetCurrentProcess(), (BYTE*)&vfs_addr, sizeof(LPVOID), results);
-		SetDbDebug2("searchDatabases scan count", results.size());
-		for (size_t i = 0; i < results.size(); i++) {
-			auto result = results[i];
-			SetDbDebug2("searchDatabases candidate", reinterpret_cast<size_t>(result));
-			int rc = SQLITE_MISUSE;
-			if (SafeSqliteErrcode(m_sqlite3Rountines, result, rc)) {
-				SetDbDebug2("searchDatabases errcode", static_cast<size_t>(rc));
-				if (rc == SQLITE_OK) {
-					try {
-						SetDbDebug("searchDatabases pragma begin");
-						nlohmann::ordered_json queryResult = execute(result, "PRAGMA database_list");
-						SetDbDebug("searchDatabases pragma ok");
-						if (!queryResult.contains("data") || !queryResult["data"].is_array() ||
-							queryResult["data"].empty() || !queryResult["data"][0].contains("file")) {
-							continue;
-						}
-						std::string dbpath = queryResult["data"][0]["file"].get<std::string>();
-						sprintf_s(g_DbDebugText, sizeof(g_DbDebugText), "searchDatabases dbpath: %s", dbpath.c_str());
-						if (dbpath.empty())
-							continue;
-						auto pos = dbpath.find_last_of("\\/");
-						std::string dbname = pos == std::string::npos ? dbpath : dbpath.substr(pos + 1);
-						if (!dbname.empty())
-							m_dbs[dbname] = result;
-					}
-					catch (...) {
-						SetDbDebug("searchDatabases candidate exception");
-						continue;
-					}
-				}
-			}
-		}
+		// Do not execute PRAGMA or arbitrary SQL on a handle captured from a
+		// WeChat worker thread.  SQLite connections are owned by WeChat's
+		// internal thread/transaction context; using them from the HTTP thread
+		// caused multi-gigabyte allocations and could terminate Weixin.exe.
+		// Contact rows are now captured from the in-process prepare/step hooks
+		// and served by /GetContact without crossing that thread boundary.
+		SetDbDebug("searchDatabases disabled for cross-thread safety");
 		SetDbDebug2("searchDatabases done count", m_dbs.size());
 		return m_dbs;
 	}

@@ -46,33 +46,12 @@ struct RuntimeProfile {
     bool valid = false;
 };
 
-std::string SqlQuote(const std::string& value)
-{
-    std::string escaped("'");
-    for (char c : value) {
-        if (c == '\'') escaped.push_back('\'');
-        escaped.push_back(c);
-    }
-    escaped.push_back('\'');
-    return escaped;
-}
-
 void ReadDatabaseProfile(RuntimeProfile& profile)
 {
-    if (profile.accountId.empty()) return;
-    try {
-        const std::string sql = "SELECT Province,City,Signature,Sex,BigHeadImgUrl,SmallHeadImgUrl FROM Contact WHERE UserName=" + SqlQuote(profile.accountId) + " LIMIT 1";
-        auto result = xmgr::DatabaseMgr::getInstance().execute("MicroMsg.db", sql);
-        if (result.value("status", -1) != 0 || !result.contains("data") || !result["data"].is_array() || result["data"].empty()) return;
-        const auto& row = result["data"][0];
-        profile.area = row.value("Province", "");
-        const std::string city = row.value("City", "");
-        if (!city.empty()) { if (!profile.area.empty()) profile.area += ","; profile.area += city; }
-        profile.signature = row.value("Signature", "");
-        profile.avatar = row.value("BigHeadImgUrl", "");
-        profile.smallAvatar = row.value("SmallHeadImgUrl", "");
-        try { profile.sex = std::stoi(row.value("Sex", "0")); } catch (...) { profile.sex = 0; }
-    } catch (...) {}
+    // The Contact database is owned by a WeChat worker thread.  Do not issue
+    // a cross-thread SQLite query from the HTTP handler; leave optional
+    // fields empty until a thread-safe profile callback is available.
+    (void)profile;
 }
 
 RuntimeProfile ReadRuntimeProfile()
@@ -170,5 +149,85 @@ void RegisterGetSelfProfile(httplib::Server& svr)
         resp["profile_phone"] = runtime.phone;
             
             res.set_content(resp.dump(), "application/json; charset=utf-8");
+        });
+}
+
+void RegisterGetContact(httplib::Server& svr)
+{
+    svr.Post("/GetContact", [](const httplib::Request& req, httplib::Response& res)
+        {
+            json resp;
+            json request;
+            try {
+                request = json::parse(req.body.empty() ? "{}" : req.body);
+            } catch (...) {
+                resp["status"] = -400;
+                resp["msg"] = "invalid json";
+                res.set_content(resp.dump(), "application/json; charset=utf-8");
+                return;
+            }
+
+            const std::string wxid = request.value("wxid", "");
+            if (wxid.empty() || wxid.size() > 512 ||
+                wxid.find('\0') != std::string::npos ||
+                wxid.find('\r') != std::string::npos ||
+                wxid.find('\n') != std::string::npos) {
+                resp["status"] = -400;
+                resp["msg"] = "wxid is required";
+                res.set_content(resp.dump(), "application/json; charset=utf-8");
+                return;
+            }
+            if (!g_IsLogin) {
+                resp["status"] = -401;
+                resp["msg"] = "微信未登录";
+                res.set_content(resp.dump(), "application/json; charset=utf-8");
+                return;
+            }
+
+            // Queue the query to the thread that is currently using the
+            // captured SQLite connection.  The HTTP worker never touches the
+            // connection directly.
+            std::string resultJson;
+            if (!RunContactQueryOnSqliteThread(wxid, resultJson, 15000)) {
+                resp["status"] = -504;
+                resp["msg"] = "contact query timed out waiting for WeChat database thread";
+                resp["wxid"] = wxid;
+                resp["sqlite_last_db_handle"] = g_SqliteLastDbHandle;
+                resp["sqlite_last_db_thread"] = g_SqliteLastDbThreadId;
+                resp["sqlite_contact_db_handle"] = g_SqliteContactDbHandle;
+                res.set_content(resp.dump(4, ' ', false), "application/json; charset=utf-8");
+                return;
+            }
+            try {
+                resp = json::parse(resultJson);
+            } catch (...) {
+                resp["status"] = -505;
+                resp["msg"] = "invalid contact query response";
+                res.set_content(resp.dump(4, ' ', false), "application/json; charset=utf-8");
+                return;
+            }
+            const int dbStatus = resp.value("status", -1);
+            if (dbStatus != 0) {
+                resp["msg"] = resp.value("desc", "contact query failed");
+                resp["wxid"] = wxid;
+                res.set_content(resp.dump(4, ' ', false), "application/json; charset=utf-8");
+                return;
+            }
+            if (!resp.contains("data") || !resp["data"].is_array() ||
+                resp["data"].empty() || !resp["data"][0].is_object()) {
+                resp = { {"status", 404}, {"msg", "contact not found"}, {"wxid", wxid} };
+                res.set_content(resp.dump(4, ' ', false), "application/json; charset=utf-8");
+                return;
+            }
+            resp = resp["data"][0];
+            resp["status"] = 0;
+            resp["contact_found"] = true;
+            resp["wxid"] = wxid;
+            if (resp.contains("ImgBuf") && resp["ImgBuf"].is_string() &&
+                resp["ImgBuf"].get<std::string>().size() > 16384) {
+                resp["ImgBuf"] = "";
+                resp["ImgBufTruncated"] = true;
+            }
+            res.set_content(resp.dump(4, ' ', false), "application/json; charset=utf-8");
         });
 }

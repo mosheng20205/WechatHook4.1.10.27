@@ -7,6 +7,7 @@
 #include <cstring>
 #include <sstream>
 #include <condition_variable>
+#include <chrono>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -25,6 +26,7 @@
 #include "http_post.h"
 #include "wx_send.h"
 #include "../xdb/sqlite3.h"
+#include "../xdb/db_mgr.h"
 
 
 
@@ -223,6 +225,19 @@ static LONG g_SyncBatchProcessorHookState = 0;
 using FnMessageObjectCopy = int64_t(__fastcall*)(int64_t object, int64_t source);
 static FnMessageObjectCopy g_OriginalMessageObjectCopy = nullptr;
 static LONG g_MessageObjectCopyHookState = 0;
+// sub_182C6D230 copies the nested MicroMsgRequestNew portion of
+// SendMsgRequestNew before it is serialized into /cgi-bin/micromsg-bin/newsendmsg.
+// This hook is observation-only: it captures fields and then calls the original.
+using FnSendMsgRequestCopy = void(__fastcall*)(void* destination, void* source);
+static FnSendMsgRequestCopy g_OriginalSendMsgRequestCopy = nullptr;
+static LONG g_SendMsgRequestObserveHookState = 0;
+// sub_182C6C060 copies one 56-byte message element.  Its source object owns
+// the field-2 and field-6 native strings at +0x10 and +0x20 respectively.
+using FnSendMsgElementCopy = int64_t(__fastcall*)(void* destination,
+                                                   void* source,
+                                                   void* arena);
+static FnSendMsgElementCopy g_OriginalSendMsgElementCopy = nullptr;
+static LONG g_SendMsgElementObserveHookState = 0;
 using FnSyncDispatcher = int64_t(__fastcall*)(int64_t);
 static FnSyncDispatcher g_OriginalSyncDispatcher = nullptr;
 static LONG g_SyncDispatcherHookState = 0;
@@ -344,6 +359,20 @@ static bool IsReadablePointer(const void* ptr)
     if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_NOACCESS) || (mbi.Protect & PAGE_GUARD))
         return false;
     return true;
+}
+
+static bool IsExecutablePointer(const void* ptr)
+{
+    if (!ptr)
+        return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(ptr, &mbi, sizeof(mbi)))
+        return false;
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+        return false;
+    const DWORD protection = mbi.Protect & 0xFF;
+    return protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ ||
+           protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
 }
 
 static void CopySafeTextN(const char* src, int len, char* dst, size_t cap)
@@ -474,6 +503,140 @@ static void RecordSqliteBindTrace16(const char* apiName, sqlite3_stmt* stmt, int
     CaptureSqlText16(text16, len, item.text, g_SqliteInterestingBindText);
 }
 
+static void CaptureSqliteDbHandle(sqlite3* db)
+{
+    if (!db)
+        return;
+    __try {
+        if (IsReadablePointer(db))
+            InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SqliteLastDbHandle),
+                                  reinterpret_cast<LONG64>(db));
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SqliteLastDbThreadId),
+                              static_cast<LONG64>(GetCurrentThreadId()));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+static void CaptureContactDbHandle(sqlite3* db, const char* sql, int nByte)
+{
+    if (!db || !sql)
+        return;
+    char text[2048]{};
+    CopySafeTextN(sql, nByte, text, sizeof(text));
+    if (!strstr(text, "Contact") && !strstr(text, "contact") &&
+        !strstr(text, "ChatRoom") && !strstr(text, "chatroom"))
+        return;
+    if (!IsReadablePointer(db))
+        return;
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SqliteContactDbHandle),
+                          reinterpret_cast<LONG64>(db));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SqliteContactDbThreadId),
+                          static_cast<LONG64>(GetCurrentThreadId()));
+}
+
+namespace {
+
+std::mutex g_ContactQueryMutex;
+std::condition_variable g_ContactQueryCv;
+bool g_ContactQueryActive = false;
+bool g_ContactQueryDone = false;
+bool g_ContactQueryClaimed = false;
+std::string g_ContactQueryWxid;
+std::string g_ContactQueryResult;
+thread_local bool g_ContactQueryInProgress = false;
+
+static std::string QuoteSqlText(const std::string& value)
+{
+    std::string quoted("'");
+    quoted.reserve(value.size() + 2);
+    for (const char c : value) {
+        if (c == '\'')
+            quoted.push_back('\'');
+        quoted.push_back(c);
+    }
+    quoted.push_back('\'');
+    return quoted;
+}
+
+static void TryProcessPendingContactQuery(sqlite3* db)
+{
+    if (!db || g_ContactQueryInProgress)
+        return;
+    std::string wxid;
+    {
+        std::lock_guard<std::mutex> lock(g_ContactQueryMutex);
+        if (!g_ContactQueryActive || g_ContactQueryClaimed)
+            return;
+        g_ContactQueryClaimed = true;
+        wxid = g_ContactQueryWxid;
+    }
+
+    g_ContactQueryInProgress = true;
+    nlohmann::ordered_json result;
+    try {
+        const std::string sql = "SELECT * FROM Contact WHERE UserName=" +
+            QuoteSqlText(wxid) + " LIMIT 1";
+        result = xmgr::DatabaseMgr::getInstance().execute(db, sql);
+    } catch (const std::exception& e) {
+        result = { {"status", -500}, {"desc", e.what()} };
+    } catch (...) {
+        result = { {"status", -501}, {"desc", "contact query exception"} };
+    }
+    g_ContactQueryInProgress = false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_ContactQueryMutex);
+        if (g_ContactQueryActive) {
+            g_ContactQueryResult = result.dump();
+            g_ContactQueryDone = true;
+        }
+        g_ContactQueryClaimed = false;
+    }
+    g_ContactQueryCv.notify_all();
+}
+
+} // namespace
+
+bool RunContactQueryOnSqliteThread(const std::string& wxid, std::string& resultJson,
+                                   uint32_t timeoutMs)
+{
+    resultJson.clear();
+    if (wxid.empty() || wxid.size() > 512 || timeoutMs == 0)
+        return false;
+    std::unique_lock<std::mutex> lock(g_ContactQueryMutex);
+    if (g_ContactQueryActive)
+        return false;
+    g_ContactQueryActive = true;
+    g_ContactQueryDone = false;
+    g_ContactQueryClaimed = false;
+    g_ContactQueryWxid = wxid;
+    g_ContactQueryResult.clear();
+    if (!g_ContactQueryCv.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                                   [] { return g_ContactQueryDone; })) {
+        g_ContactQueryActive = false;
+        g_ContactQueryWxid.clear();
+        return false;
+    }
+    resultJson = g_ContactQueryResult;
+    g_ContactQueryActive = false;
+    g_ContactQueryWxid.clear();
+    return !resultJson.empty();
+}
+
+static void CaptureSqliteDbHandleFromStmt(sqlite3_stmt* stmt)
+{
+    if (!stmt || !g_hWeixinDll)
+        return;
+    __try {
+        auto* api = reinterpret_cast<sqlite3_api_routines*>(
+            reinterpret_cast<uintptr_t>(g_hWeixinDll) + XWECHAT_SQLITE3_API_ROUTINES_OFFSET);
+        if (!IsReadablePointer(api) || !IsExecutablePointer(reinterpret_cast<void*>(api->db_handle)))
+            return;
+        CaptureSqliteDbHandle(api->db_handle(stmt));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
 static size_t CopyNativeStringAt(int64_t object, size_t offset, char* dst, size_t cap)
 {
     if (!dst || cap == 0)
@@ -522,6 +685,268 @@ static bool TryCopyNativeStringObject(int64_t object, char* dst, size_t cap)
     }
 }
 
+// Read one of the pointer-backed native strings used by the nested
+// SendMsgRequestNew object.  This routine is deliberately conservative:
+// it validates the object and string metadata, bounds the copy, and never
+// calls a Weixin routine from the observer.
+static bool CopySendRequestString(uintptr_t stringObject, char* dst, size_t cap)
+{
+    if (!dst || cap == 0 || !stringObject ||
+        !IsReadablePointer(reinterpret_cast<const void*>(stringObject)))
+        return false;
+    dst[0] = 0;
+    __try {
+        const auto* value = reinterpret_cast<const HookNativeString*>(stringObject);
+        const uint64_t length = value->length;
+        const uint64_t capacity = value->capacity;
+        if (length == 0 || length >= cap || length > 4095 ||
+            capacity < length || capacity > 0x100000)
+            return false;
+        const char* text = capacity >= 0x10 ? value->heap_buf : value->inline_buf;
+        if (!text || !IsReadablePointer(text))
+            return false;
+        memcpy(dst, text, static_cast<size_t>(length));
+        dst[length] = 0;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        dst[0] = 0;
+        return false;
+    }
+}
+
+static bool CaptureSendRequestField(void* request, size_t offset,
+                                    char* dst, size_t cap,
+                                    uint64_t* fieldObject)
+{
+    if (!request || !dst || cap == 0)
+        return false;
+    uintptr_t object = 0;
+    __try {
+        object = *reinterpret_cast<const uintptr_t*>(
+            reinterpret_cast<uintptr_t>(request) + offset);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        object = 0;
+    }
+    if (fieldObject)
+        *fieldObject = object;
+    if (object && CopySendRequestString(object, dst, cap))
+        return true;
+
+    // Keep a guarded fallback for builds where the field is embedded rather
+    // than pointer-backed.  The pointer form remains the preferred path.
+    return CopySendRequestString(reinterpret_cast<uintptr_t>(request) + offset,
+                                 dst, cap);
+}
+
+static void ObserveSendMsgRequest(void* destination, void* source)
+{
+    if (!source)
+        return;
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SendRequestObserveCalls));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendRequestObserveLastSource),
+                          static_cast<LONG64>(reinterpret_cast<uintptr_t>(source)));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendRequestObserveLastDestination),
+                          static_cast<LONG64>(reinterpret_cast<uintptr_t>(destination)));
+
+    uintptr_t vtable = 0;
+    __try { vtable = *reinterpret_cast<const uintptr_t*>(source); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { vtable = 0; }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendRequestObserveLastVtable),
+                          static_cast<LONG64>(vtable));
+    if (vtable && IsExecutablePointer(reinterpret_cast<const void*>(vtable)))
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SendRequestObserveVtableValid));
+
+    char field10[4096]{};
+    char field20[4096]{};
+    uint64_t field10Object = 0;
+    uint64_t field20Object = 0;
+    const bool got10 = CaptureSendRequestField(source, 0x10, field10,
+                                               sizeof(field10), &field10Object);
+    const bool got20 = CaptureSendRequestField(source, 0x20, field20,
+                                               sizeof(field20), &field20Object);
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendRequestObserveLastField10Object),
+                          static_cast<LONG64>(field10Object));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendRequestObserveLastField20Object),
+                          static_cast<LONG64>(field20Object));
+    g_SendRequestObserveField10[0] = 0;
+    g_SendRequestObserveField20[0] = 0;
+    if (got10) {
+        CopySafeText(field10, g_SendRequestObserveField10,
+                     sizeof(g_SendRequestObserveField10));
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SendRequestObserveFieldReadCalls));
+    }
+    if (got20) {
+        CopySafeText(field20, g_SendRequestObserveField20,
+                     sizeof(g_SendRequestObserveField20));
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SendRequestObserveFieldReadCalls));
+    }
+}
+
+static void ObserveSendMsgRequestDestination(void* destination)
+{
+    if (!destination)
+        return;
+    char field10[4096]{};
+    char field20[4096]{};
+    uint64_t field10Object = 0;
+    uint64_t field20Object = 0;
+    const bool got10 = CaptureSendRequestField(destination, 0x10, field10,
+                                               sizeof(field10), &field10Object);
+    const bool got20 = CaptureSendRequestField(destination, 0x20, field20,
+                                               sizeof(field20), &field20Object);
+    if (got10) {
+        CopySafeText(field10, g_SendRequestObserveField10,
+                     sizeof(g_SendRequestObserveField10));
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendRequestObserveLastField10Object),
+                              static_cast<LONG64>(field10Object));
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SendRequestObserveFieldReadCalls));
+    }
+    if (got20) {
+        CopySafeText(field20, g_SendRequestObserveField20,
+                     sizeof(g_SendRequestObserveField20));
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendRequestObserveLastField20Object),
+                              static_cast<LONG64>(field20Object));
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SendRequestObserveFieldReadCalls));
+    }
+}
+
+static void __fastcall Hook_SendMsgRequestCopy(void* destination, void* source)
+{
+    // Capture the source before the original copy and the destination after
+    // it.  Neither observation changes arguments, return state, or network
+    // behavior.
+    ObserveSendMsgRequest(destination, source);
+    if (g_OriginalSendMsgRequestCopy)
+        g_OriginalSendMsgRequestCopy(destination, source);
+    // The source observed above is a wrapper in the current runtime.  The
+    // copied destination is the second safe boundary to inspect; it is still
+    // read-only and is checked only after the original copy has completed.
+    ObserveSendMsgRequestDestination(destination);
+}
+
+static void InstallSendMsgRequestObserverHook()
+{
+    if (InterlockedCompareExchange(&g_SendMsgRequestObserveHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x2C6D230);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_SendMsgRequestCopy),
+                      reinterpret_cast<void**>(&g_OriginalSendMsgRequestCopy)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK)
+    {
+        g_OriginalSendMsgRequestCopy = nullptr;
+        InterlockedExchange(&g_SendMsgRequestObserveHookState, 0);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendRequestObserveHookInstalled), 0);
+    }
+    else
+    {
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendRequestObserveHookInstalled), 1);
+    }
+}
+
+static void ObserveSendMsgElement(void* destination, void* source)
+{
+    if (!source)
+        return;
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SendElementObserveCalls));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendElementObserveLastSource),
+                          static_cast<LONG64>(reinterpret_cast<uintptr_t>(source)));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendElementObserveLastDestination),
+                          static_cast<LONG64>(reinterpret_cast<uintptr_t>(destination)));
+
+    uint32_t flags = 0;
+    __try {
+        flags = *reinterpret_cast<const uint32_t*>(
+            reinterpret_cast<uintptr_t>(source) + 0x34);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        flags = 0;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendElementObserveLastFlags),
+                          static_cast<LONG64>(flags));
+    if ((flags & (0x02u | 0x20u)) == 0)
+        ;
+    else
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SendElementObserveFlagMatches));
+
+    // Field 1 is a nested base-type string.  sub_1805D3710 reads its
+    // wrapper's presence bit at +0x14 and the native string object at +0x08.
+    g_SendElementObserveField1[0] = 0;
+    uintptr_t field1Wrapper = 0;
+    uintptr_t field1Object = 0;
+    uint8_t field1Present = 0;
+    __try {
+        field1Wrapper = *reinterpret_cast<const uintptr_t*>(
+            reinterpret_cast<uintptr_t>(source) + 0x08);
+        if (field1Wrapper)
+            field1Present = *reinterpret_cast<const uint8_t*>(field1Wrapper + 0x14);
+        if (field1Wrapper && (field1Present & 1u))
+            field1Object = *reinterpret_cast<const uintptr_t*>(field1Wrapper + 0x08);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        field1Wrapper = 0;
+        field1Object = 0;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendElementObserveLastField1Wrapper),
+                          static_cast<LONG64>(field1Wrapper));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendElementObserveLastField1Object),
+                          static_cast<LONG64>(field1Object));
+    if (field1Present & 1u) {
+        char field1[4096]{};
+        if (CopySendRequestString(field1Object, field1, sizeof(field1))) {
+            CopySafeText(field1, g_SendElementObserveField1,
+                         sizeof(g_SendElementObserveField1));
+            InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SendElementObserveFieldReadCalls));
+        }
+    }
+
+    char field10[4096]{};
+    char field20[4096]{};
+    const bool got10 = (flags & 0x02u) != 0 &&
+        CaptureSendRequestField(source, 0x10, field10, sizeof(field10), nullptr);
+    const bool got20 = (flags & 0x20u) != 0 &&
+        CaptureSendRequestField(source, 0x20, field20, sizeof(field20), nullptr);
+    g_SendElementObserveField10[0] = 0;
+    g_SendElementObserveField20[0] = 0;
+    if (got10) {
+        CopySafeText(field10, g_SendElementObserveField10,
+                     sizeof(g_SendElementObserveField10));
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SendElementObserveFieldReadCalls));
+    }
+    if (got20) {
+        CopySafeText(field20, g_SendElementObserveField20,
+                     sizeof(g_SendElementObserveField20));
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SendElementObserveFieldReadCalls));
+    }
+}
+
+static int64_t __fastcall Hook_SendMsgElementCopy(void* destination,
+                                                   void* source,
+                                                   void* arena)
+{
+    ObserveSendMsgElement(destination, source);
+    return g_OriginalSendMsgElementCopy
+        ? g_OriginalSendMsgElementCopy(destination, source, arena) : 0;
+}
+
+static void InstallSendMsgElementObserverHook()
+{
+    if (InterlockedCompareExchange(&g_SendMsgElementObserveHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x2C6C060);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_SendMsgElementCopy),
+                      reinterpret_cast<void**>(&g_OriginalSendMsgElementCopy)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK)
+    {
+        g_OriginalSendMsgElementCopy = nullptr;
+        InterlockedExchange(&g_SendMsgElementObserveHookState, 0);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendElementObserveHookInstalled), 0);
+    }
+    else
+    {
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendElementObserveHookInstalled), 1);
+    }
+}
+
 static bool IsUsefulMessageText(const char* s)
 {
     if (!s || !*s)
@@ -542,6 +967,8 @@ static bool ReadMessageFields(void* message, std::string& field1, std::string& f
 struct AutoReplyTask {
     std::string wxid;
     std::string content;
+    bool is_group = false;
+    std::string sender_wxid;
 };
 
 static std::mutex g_AutoReplyMutex;
@@ -555,6 +982,32 @@ static bool IsLikelyWxid(const std::string& value)
     return value.rfind("wxid_", 0) == 0 ||
            value.find("@chatroom") != std::string::npos ||
            value == "filehelper" || value.rfind("gh_", 0) == 0;
+}
+
+static bool IsGroupWxid(const std::string& value)
+{
+    return value.find("@chatroom") != std::string::npos;
+}
+
+static bool IsSelfWxid(const std::string& value)
+{
+    if (value.empty())
+        return false;
+    if (!SelfInfo.wxid.empty() && value == SelfInfo.wxid)
+        return true;
+    return g_SyncBatchToUsername[0] && value == g_SyncBatchToUsername;
+}
+
+static void RecordAutoReplyClassification(const char* type,
+                                          const std::string& sender,
+                                          const std::string& room)
+{
+    CopySafeText(type ? type : "unknown", g_AutoReplyLastChatType,
+                 sizeof(g_AutoReplyLastChatType));
+    CopySafeText(sender.c_str(), g_AutoReplyLastSender,
+                 sizeof(g_AutoReplyLastSender));
+    CopySafeText(room.c_str(), g_AutoReplyLastRoom,
+                 sizeof(g_AutoReplyLastRoom));
 }
 
 static void StartAutoReplyWorker()
@@ -573,7 +1026,9 @@ static void StartAutoReplyWorker()
                 // the send routine on a separate thread.
                 Sleep(300);
                 if (g_IsLogin && !task.wxid.empty() && !task.content.empty()) {
-                    const std::string reply = "收到：" + task.content;
+                    // Keep the generated prefix ASCII-only so the injected
+                    // DLL does not depend on the source-file code page.
+                    const std::string reply = "[auto-reply] " + task.content;
                     if (WeixinSend::SendText(task.wxid, reply))
                         InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplySent));
                     else
@@ -584,7 +1039,9 @@ static void StartAutoReplyWorker()
     });
 }
 
-static void QueueAutoReply(const std::string& wxid, const std::string& content)
+static void QueueAutoReplyDirect(const std::string& wxid, const std::string& content,
+                                 bool isGroup = false,
+                                 const std::string& senderWxid = {})
 {
     if (!g_IsLogin || !IsLikelyWxid(wxid) || content.empty() || wxid == SelfInfo.wxid)
         return;
@@ -596,11 +1053,53 @@ static void QueueAutoReply(const std::string& wxid, const std::string& content)
         g_AutoReplyLastKey = key;
         if (g_AutoReplyQueue.size() >= 32)
             g_AutoReplyQueue.pop_front();
-        g_AutoReplyQueue.push_back({wxid, content});
+        g_AutoReplyQueue.push_back({wxid, content, isGroup, senderWxid});
     }
     StartAutoReplyWorker();
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyQueued));
     g_AutoReplyCv.notify_one();
+}
+
+// Classify incoming messages before they can reach the send worker.  In this
+// build friend replies are enabled; group replies are recognized but disabled
+// by default to prevent accidental group-wide spam.  The group switch is
+// exposed in status so it can be explicitly enabled later.
+static void ClassifyAndQueueAutoReply(const std::string& fromWxid,
+                                      const std::string& toWxid,
+                                      const std::string& content)
+{
+    if (!g_IsLogin || content.empty() || fromWxid.empty())
+        return;
+    if (IsSelfWxid(fromWxid)) {
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplySelfSkipped));
+        RecordAutoReplyClassification("self", fromWxid, {});
+        return;
+    }
+    if (IsGroupWxid(fromWxid)) {
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyGroupCandidates));
+        RecordAutoReplyClassification("group", fromWxid, fromWxid);
+        if (!g_AutoReplyGroupEnabled) {
+            InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyGroupSkipped));
+            return;
+        }
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyCandidates));
+        QueueAutoReplyDirect(fromWxid, content, true, {});
+        return;
+    }
+    if (!IsLikelyWxid(fromWxid))
+        return;
+    // A normal friend message uses the sender as the reply target.  The
+    // destination is retained for diagnostics; it must not replace sender.
+    (void)toWxid;
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyFriendCandidates));
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyCandidates));
+    RecordAutoReplyClassification("friend", fromWxid, {});
+    QueueAutoReplyDirect(fromWxid, content, false, fromWxid);
+}
+
+static void QueueAutoReply(const std::string& wxid, const std::string& content)
+{
+    ClassifyAndQueueAutoReply(wxid, {}, content);
 }
 
 static bool IsPlainTextCandidate(const char* text)
@@ -686,7 +1185,6 @@ static void CaptureStructuredMessageObject(int64_t object, int64_t source)
         CopySafeText(body, g_MessageStructContent, sizeof(g_MessageStructContent));
     }
     if (sender[0] && body[0] && IsLikelyWxid(sender)) {
-        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyCandidates));
         QueueAutoReply(sender, body);
     }
     (void)source;
@@ -751,9 +1249,124 @@ static void CaptureSyncBatchItem(int64_t item)
                              reinterpret_cast<uint64_t>(sender),
                              reinterpret_cast<uint64_t>(body));
     if (sender[0] && body[0] && IsLikelyWxid(sender)) {
-        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyCandidates));
         QueueAutoReply(sender, body);
     }
+}
+
+static bool CopyValidatedAddMsgString(int64_t item, size_t fieldOffset,
+                                      uint32_t hasBit, char* dst, size_t cap)
+{
+    if (!item || !dst || cap == 0 || !g_hWeixinDll)
+        return false;
+    dst[0] = 0;
+    __try {
+        const uint32_t hasBits = *reinterpret_cast<const uint32_t*>(item + 0x6C);
+        if ((hasBits & hasBit) == 0)
+            return false;
+
+        const uintptr_t arenaString =
+            *reinterpret_cast<const uintptr_t*>(item + fieldOffset);
+        if (!arenaString || !IsReadablePointer(reinterpret_cast<const void*>(arenaString)))
+            return false;
+
+        // micromsg.AddMsg string fields use the generated ArenaStringPtr
+        // wrapper (vtable off_1882643A8), not a raw std::string at item+off.
+        const uintptr_t stringVtable =
+            *reinterpret_cast<const uintptr_t*>(arenaString);
+        const uintptr_t expectedStringVtable =
+            reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x82643A8;
+        if (stringVtable != expectedStringVtable)
+            return false;
+
+        const uintptr_t stringRep =
+            *reinterpret_cast<const uintptr_t*>(arenaString + 8);
+        if (!stringRep || !IsReadablePointer(reinterpret_cast<const void*>(stringRep)))
+            return false;
+
+        const auto* value = reinterpret_cast<const HookNativeString*>(stringRep);
+        const uint64_t length = value->length;
+        const uint64_t capacity = value->capacity;
+        if (length == 0 || length >= cap || length > 4096 || capacity < length ||
+            capacity > 0x100000)
+            return false;
+
+        const char* text = capacity >= 0x10 ? value->heap_buf : value->inline_buf;
+        if (!text || !IsReadablePointer(text))
+            return false;
+        memcpy(dst, text, static_cast<size_t>(length));
+        dst[length] = 0;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        dst[0] = 0;
+        return false;
+    }
+}
+
+struct AddMsgCapture {
+    bool captured = false;
+    bool gotFrom = false;
+    bool gotTo = false;
+    bool gotContent = false;
+    char from[4096]{};
+    char to[4096]{};
+    char content[4096]{};
+};
+
+static bool CaptureValidatedAddMsgItemRaw(int64_t item, AddMsgCapture& capture)
+{
+    if (!item || !g_hWeixinDll)
+        return false;
+
+    __try {
+        const uintptr_t vtable = *reinterpret_cast<const uintptr_t*>(item);
+        const uintptr_t expectedVtable =
+            reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x83DF408;
+        if (vtable != expectedVtable)
+            return false;
+
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SyncBatchVtableMatches));
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SyncBatchLastCandidate),
+                              static_cast<LONG64>(item));
+
+        const uint32_t msgType = *reinterpret_cast<const uint32_t*>(item + 0x10);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SyncBatchLastMsgType),
+                              static_cast<LONG64>(msgType));
+
+        capture.gotFrom = CopyValidatedAddMsgString(item, 0x08, 0x02,
+                                                     capture.from, sizeof(capture.from));
+        capture.gotTo = CopyValidatedAddMsgString(item, 0x18, 0x04,
+                                                  capture.to, sizeof(capture.to));
+        capture.gotContent = CopyValidatedAddMsgString(item, 0x20, 0x10,
+                                                        capture.content, sizeof(capture.content));
+        if (!capture.gotFrom && !capture.gotTo && !capture.gotContent)
+            return false;
+
+        if (capture.gotFrom)
+            CopySafeText(capture.from, g_SyncBatchFromUsername, sizeof(g_SyncBatchFromUsername));
+        if (capture.gotTo)
+            CopySafeText(capture.to, g_SyncBatchToUsername, sizeof(g_SyncBatchToUsername));
+        if (capture.gotContent)
+            CopySafeText(capture.content, g_SyncBatchContent, sizeof(g_SyncBatchContent));
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SyncBatchFieldReadCalls));
+        capture.captured = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        capture.captured = false;
+    }
+    return capture.captured;
+}
+
+static bool CaptureValidatedAddMsgItem(int64_t item)
+{
+    AddMsgCapture capture{};
+    if (!CaptureValidatedAddMsgItemRaw(item, capture))
+        return false;
+    if (capture.gotFrom && capture.gotContent) {
+        const std::string fromValue(capture.from);
+        const std::string toValue(capture.gotTo ? capture.to : "");
+        const std::string contentValue(capture.content);
+        ClassifyAndQueueAutoReply(fromValue, toValue, contentValue);
+    }
+    return true;
 }
 
 static uint64_t ProbeSyncBatchVector(int64_t* vector)
@@ -772,9 +1385,15 @@ static uint64_t ProbeSyncBatchVector(int64_t* vector)
                                   static_cast<LONG64>(reinterpret_cast<uintptr_t>(vector)));
             InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SyncBatchItemCount),
                                   static_cast<LONG64>(count));
+            g_SyncBatchFromUsername[0] = 0;
+            g_SyncBatchToUsername[0] = 0;
+            g_SyncBatchContent[0] = 0;
+            // Read only validated micromsg.AddMsg items.  The vector is
+            // destroyed by sub_182C2C810 after the downstream call, so all
+            // reads must finish before the original function is entered.
             const uint64_t limit = count > 64 ? 64 : count;
             for (uint64_t i = 0; i < limit; ++i)
-                CaptureSyncBatchItem(begin + static_cast<int64_t>(i * kSyncBatchItemStride));
+                CaptureValidatedAddMsgItem(begin + static_cast<int64_t>(i * kSyncBatchItemStride));
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
     return count;
@@ -835,7 +1454,6 @@ static void TryQueueAutoReplyFromItem(int64_t item)
         std::string messageBody;
         if (ReadMessageFields(reinterpret_cast<void*>(candidate), senderId, messageBody) &&
             IsLikelyWxid(senderId) && !messageBody.empty()) {
-            InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyCandidates));
             QueueAutoReply(senderId, messageBody);
             return;
         }
@@ -862,7 +1480,6 @@ static void TryQueueAutoReplyFromDispatchObject(int64_t object)
     if (sender[0] && body[0]) {
         CopySafeText(sender, g_MessageStructTalker, sizeof(g_MessageStructTalker));
         CopySafeText(body, g_MessageStructContent, sizeof(g_MessageStructContent));
-        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyCandidates));
         QueueAutoReply(sender, body);
     }
 }
@@ -877,7 +1494,6 @@ static int64_t __fastcall Hook_PlainTextMessageProcessor(int64_t message)
     std::string messageBody;
     if (message && ReadMessageFields(reinterpret_cast<void*>(message), senderId, messageBody)) {
         if (IsLikelyWxid(senderId) && !messageBody.empty()) {
-            InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyCandidates));
             CopySafeText(senderId.c_str(), g_MessageStructTalker, sizeof(g_MessageStructTalker));
             CopySafeText(messageBody.c_str(), g_MessageStructContent, sizeof(g_MessageStructContent));
             QueueAutoReply(senderId, messageBody);
@@ -996,19 +1612,9 @@ static int64_t __fastcall Hook_RawSyncMsgProcessor(int64_t* items, uint64_t* con
                              reinterpret_cast<uint64_t>(context),
                              (static_cast<uint64_t>(static_cast<unsigned char>(a3)) << 8) |
                                  static_cast<uint64_t>(static_cast<unsigned char>(a4)));
-    __try {
-        if (ProbeRawSyncVectorCandidate("sub_182C28700_vec_rcx", reinterpret_cast<int64_t>(items)) == 0) {
-            ProbeRawSyncVectorCandidate("sub_182C28700_vec_rdx", reinterpret_cast<int64_t>(context));
-        }
-        if (items) {
-            ProbeRawSyncVectorCandidate("sub_182C28700_vec_rcx_deref0", items[0]);
-            ProbeRawSyncVectorCandidate("sub_182C28700_vec_rcx_deref1", items[1]);
-        }
-        if (context) {
-            ProbeRawSyncVectorCandidate("sub_182C28700_vec_rdx_deref0", static_cast<int64_t>(context[0]));
-            ProbeRawSyncVectorCandidate("sub_182C28700_vec_rdx_deref1", static_cast<int64_t>(context[1]));
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    // Do not dereference or call message getters on the raw sync arguments.
+    // During login this function also receives non-message bootstrap vectors;
+    // treating those as 0x70-byte message items caused unbounded allocations.
     return g_OriginalRawSyncMsgProcessor
         ? g_OriginalRawSyncMsgProcessor(items, context, a3, a4)
         : 0;
@@ -1611,26 +2217,35 @@ static int Hook_SqlitePrepare(sqlite3* db, const char* sql, int nByte,
                               sqlite3_stmt** stmt, const char** tail)
 {
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SqlitePrepareCalls));
+    CaptureSqliteDbHandle(db);
     CaptureSqlText(sql, nByte, g_SqliteLastSql, g_SqliteInterestingSql);
-    return g_OriginalSqlitePrepare
+    CaptureContactDbHandle(db, sql, nByte);
+    const int rc = g_OriginalSqlitePrepare
         ? g_OriginalSqlitePrepare(db, sql, nByte, stmt, tail)
         : SQLITE_ERROR;
+    TryProcessPendingContactQuery(db);
+    return rc;
 }
 
 static int Hook_SqlitePrepareV2(sqlite3* db, const char* sql, int nByte,
                                 sqlite3_stmt** stmt, const char** tail)
 {
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SqlitePrepareV2Calls));
+    CaptureSqliteDbHandle(db);
     CaptureSqlText(sql, nByte, g_SqliteLastSql, g_SqliteInterestingSql);
-    return g_OriginalSqlitePrepareV2
+    CaptureContactDbHandle(db, sql, nByte);
+    const int rc = g_OriginalSqlitePrepareV2
         ? g_OriginalSqlitePrepareV2(db, sql, nByte, stmt, tail)
         : SQLITE_ERROR;
+    TryProcessPendingContactQuery(db);
+    return rc;
 }
 
 static int Hook_SqliteBindText(sqlite3_stmt* stmt, int index, const char* text,
                                int nByte, void(*destructor)(void*))
 {
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SqliteBindTextCalls));
+    CaptureSqliteDbHandleFromStmt(stmt);
     CaptureSqlText(text, nByte, g_SqliteLastBindText, g_SqliteInterestingBindText);
     RecordSqliteBindTrace("bind_text", stmt, index, text, nByte);
     return g_OriginalSqliteBindText
@@ -1642,6 +2257,7 @@ static int Hook_SqliteBindText16(sqlite3_stmt* stmt, int index, const void* text
                                  int nByte, void(*destructor)(void*))
 {
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SqliteBindText16Calls));
+    CaptureSqliteDbHandleFromStmt(stmt);
     CaptureSqlText16(text, nByte, g_SqliteLastBindText, g_SqliteInterestingBindText);
     RecordSqliteBindTrace16("bind_text16", stmt, index, text, nByte);
     return g_OriginalSqliteBindText16
@@ -1652,7 +2268,12 @@ static int Hook_SqliteBindText16(sqlite3_stmt* stmt, int index, const void* text
 static int Hook_SqliteStep(sqlite3_stmt* stmt)
 {
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SqliteStepCalls));
-    return g_OriginalSqliteStep ? g_OriginalSqliteStep(stmt) : SQLITE_ERROR;
+    CaptureSqliteDbHandleFromStmt(stmt);
+    const int rc = g_OriginalSqliteStep ? g_OriginalSqliteStep(stmt) : SQLITE_ERROR;
+    if (g_SqliteLastDbHandle)
+        TryProcessPendingContactQuery(reinterpret_cast<sqlite3*>(
+            static_cast<uintptr_t>(g_SqliteLastDbHandle)));
+    return rc;
 }
 
 template <typename Fn>
@@ -1661,7 +2282,10 @@ static bool TryInstallSqliteApiHook(Fn target, void* hook, Fn* original, volatil
     if (targetStore)
         InterlockedExchange64(reinterpret_cast<volatile LONG64*>(targetStore),
                               reinterpret_cast<LONG64>(target));
-    if (!target || !IsReadablePointer(reinterpret_cast<void*>(target)))
+    // Never patch a data pointer.  The old offset table contained readable
+    // data that happened to look like a function pointer, which corrupted
+    // unrelated Weixin code and resulted in an immediate crash.
+    if (!target || !IsExecutablePointer(reinterpret_cast<void*>(target)))
         return false;
     if (MH_CreateHook(reinterpret_cast<void*>(target), hook,
                       reinterpret_cast<void**>(original)) != MH_OK)
@@ -2165,29 +2789,30 @@ void Evt_WeixinLoad()
 
     InstallLoginStateProbeHook();
     InstallLoginFinishHook();
+    // Re-enable only profile observation for the current isolation pass.
     InstallManagerGetterHook();
     InstallProfileFieldHook();
     InstallProfileContainerHooks();
-    InstallMessageReceiveHook();
+    // The older dispatch hook uses unverified getter offsets on a different
+    // message object. Keep it disabled while the safe 0x78-byte observation
+    // boundary is being validated in Hook_SyncBatchProcessor.
     InstallMessageParserHook();
     InstallPbMessageParserHooks();
     InstallDbAddMessageHook();
     InstallRawSyncMsgProcessorHook();
     InstallSyncBatchProcessorHook();
-    InstallMessageObjectCopyHook();
-    InstallPlainTextMessageProcessorHook();
-    InstallSyncDispatcherHook();
-    InstallFieldLookupHook();
-    InstallMsgReplaceHandlerHook();
-    InstallPlainTextMsgHandlerHook();
-    InstallMsgSourceParserHooks();
-    InstallMessageBranchTraceHooks();
-    InstallMessageStructCopyHook();
-    InstallMessageDbStructHooks();
-    InstallSysMsgParserHook();
-    InstallHistoryAddMsgQueryHook();
-    InstallHistoryAddMsgCommitHook();
+    // Read-only observation boundary for SendMsgRequestNew.  This does not
+    // call the sender or enqueue a request; it only records native strings
+    // when another code path invokes the copy/serialization helper.
+    InstallSendMsgRequestObserverHook();
+    InstallSendMsgElementObserverHook();
     InstallSqliteApiHooks();
+    // Message/database hooks remain disabled until the login-time memory
+    // regression is isolated.
+    // SQLite API patching is disabled for now.  Calling the 4.1.10.27
+    // internal routines from our injected callbacks caused unbounded memory
+    // growth during login; contact access must be implemented through a
+    // queued operation on WeChat's own database thread instead.
 
 #ifdef _DEBUG
     //xLog 日志

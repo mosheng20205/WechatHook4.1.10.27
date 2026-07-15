@@ -61,14 +61,53 @@ extern volatile uint64_t g_SyncBatchItemCount;
 extern volatile uint64_t g_SyncBatchLastContext;
 extern volatile uint64_t g_SyncBatchLastVector;
 extern volatile uint64_t g_SyncBatchLastCandidate;
+extern volatile uint64_t g_SyncBatchVtableMatches;
+extern volatile uint64_t g_SyncBatchFieldReadCalls;
+extern volatile uint64_t g_SyncBatchLastMsgType;
 extern char g_SyncBatchText1[4096];
 extern char g_SyncBatchText2[4096];
 extern char g_SyncBatchText3[4096];
 extern char g_SyncBatchText4[4096];
+extern char g_SyncBatchFromUsername[4096];
+extern char g_SyncBatchToUsername[4096];
+extern char g_SyncBatchContent[4096];
 extern volatile uint64_t g_AutoReplyQueued;
 extern volatile uint64_t g_AutoReplySent;
 extern volatile uint64_t g_AutoReplyFailed;
 extern volatile uint64_t g_AutoReplyCandidates;
+extern volatile uint64_t g_AutoReplyFriendCandidates;
+extern volatile uint64_t g_AutoReplyGroupCandidates;
+extern volatile uint64_t g_AutoReplyGroupSkipped;
+extern volatile uint64_t g_AutoReplySelfSkipped;
+extern volatile uint64_t g_AutoReplyGroupEnabled;
+extern char g_AutoReplyLastChatType[16];
+extern char g_AutoReplyLastSender[256];
+extern char g_AutoReplyLastRoom[256];
+// Read-only observation of the nested SendMsgRequestNew copy boundary
+// (Weixin.dll RVA 0x2C6D230). These fields never invoke or alter sending.
+extern volatile uint64_t g_SendRequestObserveCalls;
+extern volatile uint64_t g_SendRequestObserveVtableValid;
+extern volatile uint64_t g_SendRequestObserveFieldReadCalls;
+extern volatile uint64_t g_SendRequestObserveLastSource;
+extern volatile uint64_t g_SendRequestObserveLastDestination;
+extern volatile uint64_t g_SendRequestObserveLastVtable;
+extern volatile uint64_t g_SendRequestObserveLastField10Object;
+extern volatile uint64_t g_SendRequestObserveLastField20Object;
+extern volatile uint64_t g_SendRequestObserveHookInstalled;
+extern char g_SendRequestObserveField10[4096];
+extern char g_SendRequestObserveField20[4096];
+extern volatile uint64_t g_SendElementObserveCalls;
+extern volatile uint64_t g_SendElementObserveFlagMatches;
+extern volatile uint64_t g_SendElementObserveFieldReadCalls;
+extern volatile uint64_t g_SendElementObserveLastSource;
+extern volatile uint64_t g_SendElementObserveLastDestination;
+extern volatile uint64_t g_SendElementObserveLastFlags;
+extern volatile uint64_t g_SendElementObserveHookInstalled;
+extern volatile uint64_t g_SendElementObserveLastField1Object;
+extern volatile uint64_t g_SendElementObserveLastField1Wrapper;
+extern char g_SendElementObserveField1[4096];
+extern char g_SendElementObserveField10[4096];
+extern char g_SendElementObserveField20[4096];
 extern volatile uint64_t g_SysMsgParserCalls;
 extern volatile uint64_t g_HistoryAddMsgCalls;
 extern volatile uint64_t g_HistoryAddMsgCommitCalls;
@@ -84,6 +123,10 @@ extern volatile uint64_t g_SqlitePrepareV2Target;
 extern volatile uint64_t g_SqliteBindTextTarget;
 extern volatile uint64_t g_SqliteBindText16Target;
 extern volatile uint64_t g_SqliteStepTarget;
+extern volatile uint64_t g_SqliteLastDbHandle;
+extern volatile uint64_t g_SqliteLastDbThreadId;
+extern volatile uint64_t g_SqliteContactDbHandle;
+extern volatile uint64_t g_SqliteContactDbThreadId;
 extern char g_SqliteLastSql[4096];
 extern char g_SqliteInterestingSql[4096];
 extern char g_SqliteLastBindText[4096];
@@ -99,6 +142,8 @@ struct SqliteBindTrace {
 inline constexpr size_t kSqliteBindTraceCapacity = 128;
 extern SqliteBindTrace g_SqliteBindTraces[kSqliteBindTraceCapacity];
 extern volatile uint64_t g_SqliteBindTraceIndex;
+bool RunContactQueryOnSqliteThread(const std::string& wxid, std::string& resultJson,
+                                   uint32_t timeoutMs);
 extern volatile uint64_t g_MessageParserCalls;
 extern volatile uint64_t g_MessageParserLastObject;
 extern volatile uint64_t g_SyncContextObject;
@@ -212,8 +257,11 @@ inline HttpServer* g_httpServer = nullptr;
 inline constexpr uint64_t g_Patch_Revoke = 0x22D09E7;
 
 
-constexpr size_t XWECHAT_SQLITE3_VFS_OFFSET = 0x824F840;
-constexpr size_t XWECHAT_SQLITE3_API_ROUTINES_OFFSET = 0x824F8F8;
+// Weixin 4.1.10.27 (IDA imagebase 0x180000000).
+// The previous 0x824F840/0x824F8F8 values pointed into unrelated data and
+// caused the contact query path to call arbitrary addresses after login.
+constexpr size_t XWECHAT_SQLITE3_VFS_OFFSET = 0xA6C04A8;
+constexpr size_t XWECHAT_SQLITE3_API_ROUTINES_OFFSET = 0x8BB0D38;
 constexpr size_t XWECHAT_SQLCIPHER_API_ROUTINES_OFFSET = 0x824FB48;
 constexpr size_t XWECHAT_SQLITE3_CODEC_GET_KEY_FUNC = 0x4EE64D0;	//可以废弃不用
 
