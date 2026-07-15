@@ -229,14 +229,9 @@ namespace xmgr {
 	nlohmann::ordered_json DatabaseMgr::getDatabaseInfo() {
 		nlohmann::ordered_json jdbs = nlohmann::ordered_json::array();
 		if (!g_IsLogin)
-		{
-			//OutputDebugStringA("[getDatabaseInfo] 用户未登录\n");
 			return jdbs;
-		}
-			// do force research
-
-		//OutputDebugStringA("[getDatabaseInfo] 用户已登录\n");
-
+		// Force a scan. The presence of live MicroMsg databases is the
+		// observable login signal available in this build.
 		m_dbs.clear();
 		auto& dbs = searchDatabases();
 		for (auto& db : dbs) {

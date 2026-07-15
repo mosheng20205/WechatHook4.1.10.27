@@ -129,6 +129,45 @@ void Route_QueryDB(httplib::Server& svr)
     svr.Get("/QueryDB/status", [](const httplib::Request&, httplib::Response& res) {
         json resp;
         resp["IsLogin"] = g_IsLogin;
+        resp["LoginProbeCalls"] = g_LoginProbeCalls;
+        resp["LoginProbeLast"] = g_LoginProbeLast;
+        resp["LoginFinishCalls"] = g_LoginFinishCalls;
+        resp["LoginFinishContext"] = g_LoginFinishContext;
+        resp["LoginFinishPayload"] = g_LoginFinishPayload;
+        resp["ProfileGetterCalls"] = g_ProfileGetterCalls;
+        resp["ProfileObject"] = g_ProfileObject;
+        resp["ProfileFieldCalls"] = g_ProfileFieldCalls;
+        resp["ProfileFieldObject"] = g_ProfileFieldObject;
+        resp["ProfileFieldDescriptor"] = g_ProfileFieldDescriptor;
+        resp["ProfileContainer830Calls"] = g_ProfileContainer830Calls;
+        resp["ProfileContainer830Object"] = g_ProfileContainer830Object;
+        resp["ProfileContainer830Root"] = g_ProfileContainer830Root;
+        resp["ProfileContainer830Second"] = g_ProfileContainer830Second;
+        resp["ProfileContainerFC00Calls"] = g_ProfileContainerFC00Calls;
+        resp["ProfileContainerFC00Object"] = g_ProfileContainerFC00Object;
+        resp["ProfileContainerFC00Root"] = g_ProfileContainerFC00Root;
+        resp["ProfileContainerFC00Second"] = g_ProfileContainerFC00Second;
+        resp["ManagerContainerGetterCalls"] = g_ManagerContainerGetterCalls;
+        resp["ManagerContainerObject"] = g_ManagerContainerObject;
+        resp["ProfileFieldTrace"] = json::array();
+        const uint64_t end = g_ProfileTraceIndex;
+        const uint64_t begin = end > kProfileTraceCapacity
+            ? end - kProfileTraceCapacity : 0;
+        for (uint64_t seq = begin; seq < end; ++seq) {
+            const auto& item = g_ProfileTraces[seq % kProfileTraceCapacity];
+            if (item.sequence != seq)
+                continue;
+            resp["ProfileFieldTrace"].push_back({
+                {"sequence", item.sequence},
+                {"object", item.object},
+                {"output", item.output},
+                {"descriptor", item.descriptor},
+                {"result", item.result},
+                {"caller", item.caller},
+                {"outputBytes", nlohmann::json::binary(std::vector<uint8_t>(
+                    item.outputBytes, item.outputBytes + sizeof(item.outputBytes)))}
+            });
+        }
         resp["hWeixin"] = (uint64_t)g_hWeixinDll;
         res.set_content(resp.dump(4, ' ', false), "application/json");
         });

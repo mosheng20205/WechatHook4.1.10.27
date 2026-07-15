@@ -23,6 +23,38 @@ extern DWORD 进程PID;
 extern DWORD 父进程PID;
 extern HWND  g_WeixinMainHwnd;
 extern volatile uint64_t g_IsLogin;   // 0=未登录 1=已登录
+extern volatile uint64_t g_LoginProbeCalls;
+extern volatile uint64_t g_LoginProbeLast;
+extern volatile uint64_t g_LoginFinishCalls;
+extern volatile uint64_t g_LoginFinishContext;
+extern volatile uint64_t g_LoginFinishPayload;
+extern volatile uint64_t g_ProfileGetterCalls;
+extern volatile uint64_t g_ProfileObject;
+extern volatile uint64_t g_ProfileFieldCalls;
+extern volatile uint64_t g_ProfileFieldObject;
+extern volatile uint64_t g_ProfileFieldDescriptor;
+extern volatile uint64_t g_ProfileContainer830Calls;
+extern volatile uint64_t g_ProfileContainer830Object;
+extern volatile uint64_t g_ProfileContainer830Root;
+extern volatile uint64_t g_ProfileContainer830Second;
+extern volatile uint64_t g_ProfileContainerFC00Calls;
+extern volatile uint64_t g_ProfileContainerFC00Object;
+extern volatile uint64_t g_ProfileContainerFC00Root;
+extern volatile uint64_t g_ProfileContainerFC00Second;
+extern volatile uint64_t g_ManagerContainerGetterCalls;
+extern volatile uint64_t g_ManagerContainerObject;
+struct ProfileFieldTrace {
+    uint64_t object;
+    uint64_t output;
+    uint64_t descriptor;
+    uint64_t result;
+    uint64_t sequence;
+    uint64_t caller;
+    uint8_t outputBytes[32];
+};
+inline constexpr size_t kProfileTraceCapacity = 64;
+extern ProfileFieldTrace g_ProfileTraces[kProfileTraceCapacity];
+extern volatile uint64_t g_ProfileTraceIndex;
 extern volatile uint64_t g_getprofile;
 
 extern volatile bool g_LoginMonitorRunning;
@@ -67,9 +99,9 @@ inline HttpServer* g_httpServer = nullptr;
 inline constexpr uint64_t g_Patch_Revoke = 0x22D09E7;
 
 
-constexpr size_t XWECHAT_SQLITE3_VFS_OFFSET = 0xA6C0490;
-constexpr size_t XWECHAT_SQLITE3_API_ROUTINES_OFFSET = 0x8BB0D38;
-constexpr size_t XWECHAT_SQLCIPHER_API_ROUTINES_OFFSET = 0x8BB1570;
+constexpr size_t XWECHAT_SQLITE3_VFS_OFFSET = 0x824F840;
+constexpr size_t XWECHAT_SQLITE3_API_ROUTINES_OFFSET = 0x824F8F8;
+constexpr size_t XWECHAT_SQLCIPHER_API_ROUTINES_OFFSET = 0x824FB48;
 constexpr size_t XWECHAT_SQLITE3_CODEC_GET_KEY_FUNC = 0x4EE64D0;	//可以废弃不用
 
 namespace offset

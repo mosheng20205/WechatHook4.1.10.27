@@ -12,6 +12,28 @@
    全局真实 DLL 句柄
    ========================= */
 static HMODULE g_hRealVersion = nullptr;
+static LONG g_deferredInitStarted = 0;
+
+static DWORD WINAPI DeferredInitThread(LPVOID)
+{
+    // version.dll is loaded very early. Wait until the real Weixin module is
+    // present before initializing hooks and the HTTP server.
+    while (!GetModuleHandleW(L"Weixin.dll"))
+    {
+        Sleep(100);
+    }
+
+    g_hWeixinExe = GetModuleHandleW(L"weixin.exe");
+    if (!g_hWeixinExe)
+        return 0;
+
+    const MH_STATUS status = MH_Initialize();
+    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED)
+        return 0;
+
+    Evt_WeixinLoad();
+    return 0;
+}
 
 /* =========================
    加载真实 version.dll
@@ -276,12 +298,12 @@ void InitRealDll()
    ========================= */
 void CustomInit(HMODULE hModule)
 {
-    g_hWeixinExe = GetModuleHandleW(L"weixin.exe");
-    if (!g_hWeixinExe)
+    if (InterlockedCompareExchange(&g_deferredInitStarted, 1, 0) != 0)
         return;
 
-    if (MH_Initialize() != MH_OK)
-        return;
-
-    Evt_WeixinLoad();
+    HANDLE thread = CreateThread(nullptr, 0, DeferredInitThread, nullptr, 0, nullptr);
+    if (thread)
+        CloseHandle(thread);
+    else
+        InterlockedExchange(&g_deferredInitStarted, 0);
 }
