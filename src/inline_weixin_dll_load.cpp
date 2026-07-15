@@ -6,6 +6,10 @@
 #include <winternl.h>
 #include <cstring>
 #include <sstream>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 #include "http_server.h"
 #include "Hook_Method.h"
@@ -19,6 +23,7 @@
 #include "inline_weixin_dll_load.h"
 #include "hook_xlog.h"
 #include "http_post.h"
+#include "wx_send.h"
 #include "../xdb/sqlite3.h"
 
 
@@ -209,6 +214,15 @@ static LONG g_DbAddMessageHookState = 0;
 using FnRawSyncMsgProcessor = int64_t(__fastcall*)(int64_t* items, uint64_t* context, char a3, char a4);
 static FnRawSyncMsgProcessor g_OriginalRawSyncMsgProcessor = nullptr;
 static LONG g_RawSyncMsgProcessorHookState = 0;
+// sub_182C2C810 passes the 0x78-byte sync vector to sub_1816D5180.  This is
+// the first ordinary-text processing stage after the raw sync dispatcher.
+using FnSyncBatchProcessor = char(__fastcall*)(int64_t context, int64_t* items,
+                                                unsigned char a3, char a4);
+static FnSyncBatchProcessor g_OriginalSyncBatchProcessor = nullptr;
+static LONG g_SyncBatchProcessorHookState = 0;
+using FnMessageObjectCopy = int64_t(__fastcall*)(int64_t object, int64_t source);
+static FnMessageObjectCopy g_OriginalMessageObjectCopy = nullptr;
+static LONG g_MessageObjectCopyHookState = 0;
 using FnSyncDispatcher = int64_t(__fastcall*)(int64_t);
 static FnSyncDispatcher g_OriginalSyncDispatcher = nullptr;
 static LONG g_SyncDispatcherHookState = 0;
@@ -522,6 +536,370 @@ static bool IsUsefulMessageText(const char* s)
     return false;
 }
 
+struct NativeWxString;
+static bool ReadMessageFields(void* message, std::string& field1, std::string& field2);
+
+struct AutoReplyTask {
+    std::string wxid;
+    std::string content;
+};
+
+static std::mutex g_AutoReplyMutex;
+static std::condition_variable g_AutoReplyCv;
+static std::deque<AutoReplyTask> g_AutoReplyQueue;
+static std::once_flag g_AutoReplyWorkerOnce;
+static std::string g_AutoReplyLastKey;
+
+static bool IsLikelyWxid(const std::string& value)
+{
+    return value.rfind("wxid_", 0) == 0 ||
+           value.find("@chatroom") != std::string::npos ||
+           value == "filehelper" || value.rfind("gh_", 0) == 0;
+}
+
+static void StartAutoReplyWorker()
+{
+    std::call_once(g_AutoReplyWorkerOnce, [] {
+        std::thread([] {
+            for (;;) {
+                AutoReplyTask task;
+                {
+                    std::unique_lock<std::mutex> lock(g_AutoReplyMutex);
+                    g_AutoReplyCv.wait(lock, [] { return !g_AutoReplyQueue.empty(); });
+                    task = std::move(g_AutoReplyQueue.front());
+                    g_AutoReplyQueue.pop_front();
+                }
+                // Let WeChat finish its receive/commit path before entering
+                // the send routine on a separate thread.
+                Sleep(300);
+                if (g_IsLogin && !task.wxid.empty() && !task.content.empty()) {
+                    const std::string reply = "收到：" + task.content;
+                    if (WeixinSend::SendText(task.wxid, reply))
+                        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplySent));
+                    else
+                        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyFailed));
+                }
+            }
+        }).detach();
+    });
+}
+
+static void QueueAutoReply(const std::string& wxid, const std::string& content)
+{
+    if (!g_IsLogin || !IsLikelyWxid(wxid) || content.empty() || wxid == SelfInfo.wxid)
+        return;
+    const std::string key = wxid + "\n" + content;
+    {
+        std::lock_guard<std::mutex> lock(g_AutoReplyMutex);
+        if (key == g_AutoReplyLastKey)
+            return;
+        g_AutoReplyLastKey = key;
+        if (g_AutoReplyQueue.size() >= 32)
+            g_AutoReplyQueue.pop_front();
+        g_AutoReplyQueue.push_back({wxid, content});
+    }
+    StartAutoReplyWorker();
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyQueued));
+    g_AutoReplyCv.notify_one();
+}
+
+static bool IsPlainTextCandidate(const char* text)
+{
+    if (!text || !*text)
+        return false;
+    const size_t n = strlen(text);
+    if (n == 0 || n > 2048 || text[0] == '<')
+        return false;
+    bool hasNonAscii = false;
+    bool hasAlphaNumeric = false;
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        if (c < 0x20 && c != '\t' && c != '\r' && c != '\n')
+            return false;
+        if (c >= 0x80)
+            hasNonAscii = true;
+        if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z'))
+            hasAlphaNumeric = true;
+    }
+    return hasNonAscii || hasAlphaNumeric;
+}
+
+static uintptr_t ReadPointerSafe(int64_t address);
+
+static void ConsiderSyncBatchText(const char* text, char* sender, size_t senderCap,
+                                  char* body, size_t bodyCap)
+{
+    if (!text || !*text || !sender || !body)
+        return;
+    if (!sender[0] && IsLikelyWxid(text)) {
+        CopySafeText(text, sender, senderCap);
+        return;
+    }
+    if (!body[0] && !IsLikelyWxid(text) && IsPlainTextCandidate(text))
+        CopySafeText(text, body, bodyCap);
+}
+
+static void CaptureStructuredMessageObject(int64_t object, int64_t source)
+{
+    if (!object)
+        return;
+
+    // sub_180A19E90 copies the two username-like members to +0x18/+0x38
+    // and the content-like members to +0x180/+0x1C0. Keep these exact fields
+    // visible through QueryDB while also probing the remaining native strings.
+    g_SyncBatchText1[0] = g_SyncBatchText2[0] = 0;
+    g_SyncBatchText3[0] = g_SyncBatchText4[0] = 0;
+    CopyNativeStringAt(object, 0x18, g_SyncBatchText1, sizeof(g_SyncBatchText1));
+    CopyNativeStringAt(object, 0x38, g_SyncBatchText2, sizeof(g_SyncBatchText2));
+    CopyNativeStringAt(object, 0x180, g_SyncBatchText3, sizeof(g_SyncBatchText3));
+    CopyNativeStringAt(object, 0x1C0, g_SyncBatchText4, sizeof(g_SyncBatchText4));
+
+    char sender[256]{};
+    char body[4096]{};
+    ConsiderSyncBatchText(g_SyncBatchText1, sender, sizeof(sender), body, sizeof(body));
+    ConsiderSyncBatchText(g_SyncBatchText2, sender, sizeof(sender), body, sizeof(body));
+    // Prefer the content slots before falling back to other object fields.
+    if (!body[0]) {
+        ConsiderSyncBatchText(g_SyncBatchText3, sender, sizeof(sender), body, sizeof(body));
+        ConsiderSyncBatchText(g_SyncBatchText4, sender, sizeof(sender), body, sizeof(body));
+    }
+
+    static constexpr size_t kObjectTextOffsets[] = {
+        0x58, 0x78, 0x98, 0x100, 0x120, 0x144, 0x180, 0x1A0,
+        0x1C0, 0x1E0, 0x248, 0x260, 0x278, 0x288, 0x2B8
+    };
+    for (const size_t off : kObjectTextOffsets) {
+        char text[4096]{};
+        if (CopyNativeStringAt(object, off, text, sizeof(text)))
+            ConsiderSyncBatchText(text, sender, sizeof(sender), body, sizeof(body));
+    }
+
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SyncBatchLastCandidate),
+                          static_cast<LONG64>(object));
+    if (sender[0]) {
+        CopySafeText(sender, g_FieldFromText, sizeof(g_FieldFromText));
+        CopySafeText(sender, g_MessageStructTalker, sizeof(g_MessageStructTalker));
+    }
+    if (body[0]) {
+        CopySafeText(body, g_FieldContentText, sizeof(g_FieldContentText));
+        CopySafeText(body, g_MessageStructContent, sizeof(g_MessageStructContent));
+    }
+    if (sender[0] && body[0] && IsLikelyWxid(sender)) {
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyCandidates));
+        QueueAutoReply(sender, body);
+    }
+    (void)source;
+}
+
+static int64_t __fastcall Hook_MessageObjectCopy(int64_t object, int64_t source)
+{
+    const int64_t result = g_OriginalMessageObjectCopy
+        ? g_OriginalMessageObjectCopy(object, source) : object;
+    CaptureStructuredMessageObject(object, source);
+    return result;
+}
+
+static void InstallMessageObjectCopyHook()
+{
+    if (InterlockedCompareExchange(&g_MessageObjectCopyHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0xA1B9C0);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_MessageObjectCopy),
+                      reinterpret_cast<void**>(&g_OriginalMessageObjectCopy)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        g_OriginalMessageObjectCopy = nullptr;
+        InterlockedExchange(&g_MessageObjectCopyHookState, 0);
+    }
+}
+
+static void CaptureSyncBatchItem(int64_t item)
+{
+    if (!item)
+        return;
+    char sender[256]{};
+    char body[4096]{};
+
+    // sub_182C2C810 destroys each item after processing it. Read only while
+    // the item is live, and probe both inline/native-string fields and pointer
+    // fields. This is diagnostic first; it does not alter the vector.
+    for (size_t off = 0; off <= 0x78; off += 8) {
+        char text[4096]{};
+        if (TryCopyNativeStringObject(item + static_cast<int64_t>(off),
+                                      text, sizeof(text)))
+            ConsiderSyncBatchText(text, sender, sizeof(sender), body, sizeof(body));
+        const uintptr_t ptr = ReadPointerSafe(item + static_cast<int64_t>(off));
+        if (ptr && TryCopyNativeStringObject(static_cast<int64_t>(ptr),
+                                             text, sizeof(text)))
+            ConsiderSyncBatchText(text, sender, sizeof(sender), body, sizeof(body));
+    }
+
+    if (!sender[0] && !body[0])
+        return;
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SyncBatchLastCandidate),
+                          static_cast<LONG64>(item));
+    if (sender[0]) {
+        CopySafeText(sender, g_FieldFromText, sizeof(g_FieldFromText));
+        CopySafeText(sender, g_MessageStructTalker, sizeof(g_MessageStructTalker));
+    }
+    if (body[0]) {
+        CopySafeText(body, g_FieldContentText, sizeof(g_FieldContentText));
+        CopySafeText(body, g_MessageStructContent, sizeof(g_MessageStructContent));
+    }
+    RecordMessageBranchTrace("sub_1816D5180_item", 0,
+                             static_cast<uint64_t>(item),
+                             reinterpret_cast<uint64_t>(sender),
+                             reinterpret_cast<uint64_t>(body));
+    if (sender[0] && body[0] && IsLikelyWxid(sender)) {
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyCandidates));
+        QueueAutoReply(sender, body);
+    }
+}
+
+static uint64_t ProbeSyncBatchVector(int64_t* vector)
+{
+    if (!vector)
+        return 0;
+    uint64_t count = 0;
+    __try {
+        const int64_t begin = vector[0];
+        const int64_t end = vector[1];
+        constexpr int64_t kSyncBatchItemStride = 0x78;
+        if (begin && end >= begin && (end - begin) <= kSyncBatchItemStride * 1024 &&
+            ((end - begin) % kSyncBatchItemStride) == 0) {
+            count = static_cast<uint64_t>((end - begin) / kSyncBatchItemStride);
+            InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SyncBatchLastVector),
+                                  static_cast<LONG64>(reinterpret_cast<uintptr_t>(vector)));
+            InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SyncBatchItemCount),
+                                  static_cast<LONG64>(count));
+            const uint64_t limit = count > 64 ? 64 : count;
+            for (uint64_t i = 0; i < limit; ++i)
+                CaptureSyncBatchItem(begin + static_cast<int64_t>(i * kSyncBatchItemStride));
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return count;
+}
+
+static char __fastcall Hook_SyncBatchProcessor(int64_t context, int64_t* items,
+                                                unsigned char a3, char a4)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SyncBatchProcessorCalls));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SyncBatchLastContext),
+                          static_cast<LONG64>(context));
+    RecordMessageBranchTrace("sub_1816D5180_args",
+                             reinterpret_cast<uint64_t>(g_hWeixinDll) + 0x16D5180,
+                             static_cast<uint64_t>(context),
+                             reinterpret_cast<uint64_t>(items),
+                             (static_cast<uint64_t>(a3) << 8) |
+                                 static_cast<uint64_t>(static_cast<unsigned char>(a4)));
+    ProbeSyncBatchVector(items);
+    return g_OriginalSyncBatchProcessor
+        ? g_OriginalSyncBatchProcessor(context, items, a3, a4) : 0;
+}
+
+static void InstallSyncBatchProcessorHook()
+{
+    if (InterlockedCompareExchange(&g_SyncBatchProcessorHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x16D5180);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_SyncBatchProcessor),
+                      reinterpret_cast<void**>(&g_OriginalSyncBatchProcessor)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        g_OriginalSyncBatchProcessor = nullptr;
+        InterlockedExchange(&g_SyncBatchProcessorHookState, 0);
+    }
+}
+
+static uintptr_t ReadPointerSafe(int64_t address)
+{
+    uintptr_t value = 0;
+    __try {
+        value = *reinterpret_cast<uintptr_t*>(address);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return value;
+}
+
+static void TryQueueAutoReplyFromItem(int64_t item)
+{
+    // The vector element is a 0x70-byte wrapper. Depending on message type,
+    // the getter object is either the element itself or one of its pointer
+    // fields, so probe both forms using the guarded native getters.
+    for (int off = -1; off < 0x70; off += 8) {
+        uintptr_t candidate = static_cast<uintptr_t>(item);
+        if (off >= 0) {
+            candidate = ReadPointerSafe(item + off);
+        }
+        if (!candidate)
+            continue;
+        std::string senderId;
+        std::string messageBody;
+        if (ReadMessageFields(reinterpret_cast<void*>(candidate), senderId, messageBody) &&
+            IsLikelyWxid(senderId) && !messageBody.empty()) {
+            InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyCandidates));
+            QueueAutoReply(senderId, messageBody);
+            return;
+        }
+    }
+}
+
+static void TryQueueAutoReplyFromDispatchObject(int64_t object)
+{
+    if (!object)
+        return;
+    char sender[256]{};
+    char body[4096]{};
+    for (size_t off = 0; off <= 0x380; off += 8) {
+        char text[4096]{};
+        if (!CopyNativeStringAt(object, off, text, sizeof(text)))
+            continue;
+        if (sender[0] == 0 && IsLikelyWxid(text)) {
+            CopySafeText(text, sender, sizeof(sender));
+            continue;
+        }
+        if (body[0] == 0 && IsUsefulMessageText(text) && !IsLikelyWxid(text))
+            CopySafeText(text, body, sizeof(body));
+    }
+    if (sender[0] && body[0]) {
+        CopySafeText(sender, g_MessageStructTalker, sizeof(g_MessageStructTalker));
+        CopySafeText(body, g_MessageStructContent, sizeof(g_MessageStructContent));
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyCandidates));
+        QueueAutoReply(sender, body);
+    }
+}
+
+using FnPlainTextMessageProcessor = int64_t(__fastcall*)(int64_t message);
+static FnPlainTextMessageProcessor g_OriginalPlainTextMessageProcessor = nullptr;
+static LONG g_PlainTextMessageProcessorHookState = 0;
+
+static int64_t __fastcall Hook_PlainTextMessageProcessor(int64_t message)
+{
+    std::string senderId;
+    std::string messageBody;
+    if (message && ReadMessageFields(reinterpret_cast<void*>(message), senderId, messageBody)) {
+        if (IsLikelyWxid(senderId) && !messageBody.empty()) {
+            InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyCandidates));
+            CopySafeText(senderId.c_str(), g_MessageStructTalker, sizeof(g_MessageStructTalker));
+            CopySafeText(messageBody.c_str(), g_MessageStructContent, sizeof(g_MessageStructContent));
+            QueueAutoReply(senderId, messageBody);
+        }
+    }
+    return g_OriginalPlainTextMessageProcessor
+        ? g_OriginalPlainTextMessageProcessor(message) : 0;
+}
+
+static void InstallPlainTextMessageProcessorHook()
+{
+    if (InterlockedCompareExchange(&g_PlainTextMessageProcessorHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x29EFD30);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_PlainTextMessageProcessor),
+                      reinterpret_cast<void**>(&g_OriginalPlainTextMessageProcessor)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        g_OriginalPlainTextMessageProcessor = nullptr;
+        InterlockedExchange(&g_PlainTextMessageProcessorHookState, 0);
+    }
+}
+
 static void CaptureRawSyncMessageItem(int64_t item)
 {
     if (!item)
@@ -574,6 +952,7 @@ static void CaptureRawSyncMessageItem(int64_t item)
             CopySafeText(body, g_MessageStructContent, sizeof(g_MessageStructContent));
         }
     }
+    TryQueueAutoReplyFromItem(item);
     if (foundCount > 0) {
         InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_MessageStructCopyCalls));
         RecordMessageBranchTrace("sub_182C28700_item", 0,
@@ -1464,6 +1843,7 @@ static void PostReceivedMessage(void* message, unsigned int type,
 
 static char __fastcall Hook_MessageDispatch(void* manager, void* message, unsigned int type)
 {
+    TryQueueAutoReplyFromDispatchObject(reinterpret_cast<int64_t>(message));
     std::string field1;
     std::string field2;
     const bool captured = ReadMessageFields(message, field1, field2);
@@ -1793,6 +2173,9 @@ void Evt_WeixinLoad()
     InstallPbMessageParserHooks();
     InstallDbAddMessageHook();
     InstallRawSyncMsgProcessorHook();
+    InstallSyncBatchProcessorHook();
+    InstallMessageObjectCopyHook();
+    InstallPlainTextMessageProcessorHook();
     InstallSyncDispatcherHook();
     InstallFieldLookupHook();
     InstallMsgReplaceHandlerHook();

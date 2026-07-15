@@ -9,6 +9,16 @@
 - 当前在该分发器中最稳定命中的普通测试链路仍偏系统同步分支；解析发送者和正文时，不要再盲目套用候选偏移，优先追踪消息入队/数据库写入/上层普通文本处理函数。
 - 下一步目标：解析 `a1 + 0x20` 指向对象中的普通文本消息对象，提取发送者和正文；确认字段后再接入回调和自动回复。
 
+## 已验证：普通文本接收、wxid 拆分与自动回复
+
+- 适用版本：微信 `4.1.10.27`，目标模块为 `Weixin.dll`。
+- IDA MCP 已确认 `sub_182C28700 -> sub_182C2C810 -> sub_1816D5180` 是普通同步消息处理链；`sub_1816D5180` 使用 0x78（120）字节消息项步长。
+- `sub_180A1B9C0` 将原始消息项复制为结构化消息对象。结构化对象中已在真实运行时验证：`object + 0x18`（`SyncBatchText1`）为发送者 wxid，`object + 0x38`（`SyncBatchText2`）为当前账号 wxid，`object + 0x180`（`SyncBatchText3`）为普通文本正文，`object + 0x1C0`（`SyncBatchText4`）为 msgsource XML。
+- 实测其他账号发送 `你好456`：`SyncBatchText1 = wxid_orly2zssd5e112`，`SyncBatchText2 = wxid_ip31nye3qygp22`，`SyncBatchText3 = 你好456`。
+- `QueryDB/status` 实测计数为 `AutoReplyCandidates = 1`、`AutoReplyQueued = 1`、`AutoReplySent = 1`、`AutoReplyFailed = 0`，证明已成功提取发送者 wxid、正文并调用异步自动回复发送逻辑。
+- 自动回复通过独立工作线程调用 `WeixinSend::SendText(sender_wxid, "收到：" + content)`；接收 Hook 内不得直接重入发送函数。发送前仍需检查登录状态、wxid 格式、空正文和自身 wxid，避免误发。
+- `SyncBatchText4` 仅为消息元数据，不应作为普通文本正文；SQLite 继续只用于联系人/历史消息查询，不作为实时接收消息入口。
+
 ## 修改规则
 
 - 仅对已在 IDA 和运行时验证过的偏移加 Hook。
