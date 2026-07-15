@@ -1,6 +1,7 @@
 #include "httplib.h"
 #include "json.hpp"
 #include <windows.h>
+#include "global.h"
 #include "wx_send.h"
 #include "SendTextMsg.h"
 
@@ -28,11 +29,25 @@ void Route_SendTextMsg(httplib::Server& svr)
             std::string wxidorgid = reqJson.value("wxidorgid", "");
             std::string msg = reqJson.value("msg", "");
 
-            WeixinSend::SendText(wxidorgid, msg);
+            res.set_header("Content-Type", "application/json; charset=utf-8");
+            if (!g_IsLogin) {
+                resp["ret"] = -2;
+                resp["msg"] = "not logged in";
+                res.set_content(resp.dump(), "application/json; charset=utf-8");
+                return;
+            }
+            if (wxidorgid.empty() || msg.empty()) {
+                resp["ret"] = -1;
+                resp["msg"] = "wxidorgid and msg are required";
+                res.set_content(resp.dump(), "application/json; charset=utf-8");
+                return;
+            }
 
+            const bool queued = WeixinSend::SendText(wxidorgid, msg);
 
-            resp["ret"] = 0;
-            resp["retmsg"] = "success";
+            resp["ret"] = queued ? 0 : -3;
+            resp["retmsg"] = queued ? "queued" : "send failed";
+            resp["queued"] = queued;
 
             res.set_content(resp.dump(), "application/json");
         });

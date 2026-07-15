@@ -4,6 +4,40 @@
 #include "global.h"
 #include "tools.h"
 
+static void SetDbDebug(const char* text) {
+	if (!text) return;
+	sprintf_s(g_DbDebugText, sizeof(g_DbDebugText), "%s", text);
+}
+
+static void SetDbDebug2(const char* text, size_t value) {
+	if (!text) return;
+	sprintf_s(g_DbDebugText, sizeof(g_DbDebugText), "%s: 0x%llX", text, static_cast<unsigned long long>(value));
+}
+
+static bool SafeReadablePtr(const void* ptr) {
+	if (!ptr) return false;
+	MEMORY_BASIC_INFORMATION mbi{};
+	if (!VirtualQuery(ptr, &mbi, sizeof(mbi)))
+		return false;
+	if (mbi.State != MEM_COMMIT)
+		return false;
+	if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))
+		return false;
+	return true;
+}
+
+static bool SafeSqliteErrcode(sqlite3_api_routines* routines, LPVOID db, int& rc) {
+	if (!routines || !routines->errcode || !SafeReadablePtr(db))
+		return false;
+	__try {
+		rc = routines->errcode(db);
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return false;
+	}
+}
+
 static void codec_get_key(sqlite3CodecGetKey func, sqlite3* db, int index, void** pKey, int* pLen) {
 	__try {
 		func(db, index, pKey, pLen);
@@ -30,6 +64,7 @@ namespace xmgr {
 	}
 
 	DatabaseMgr::DatabaseMgr() {
+		SetDbDebug("DatabaseMgr ctor begin");
 		size_t module_base = (size_t)g_hWeixinDll;
 		m_sqlite3Rountines = (sqlite3_api_routines*)(module_base + XWECHAT_SQLITE3_API_ROUTINES_OFFSET);
 		m_sqlcipherRountines = (sqlcipher_api_routines*)(module_base + XWECHAT_SQLCIPHER_API_ROUTINES_OFFSET);
@@ -39,6 +74,7 @@ namespace xmgr {
 		m_backupAsmCode.resize(nopData.size(), 0);
 		ReadProcessMemory(GetCurrentProcess(), patchAddress, m_backupAsmCode.data(), m_backupAsmCode.size(), nullptr);
 		WriteProcessMemory(GetCurrentProcess(), patchAddress, (LPCVOID)nopData.data(), nopData.size(), 0);
+		SetDbDebug("DatabaseMgr ctor ok");
 	}
 
 	DatabaseMgr::~DatabaseMgr() {
@@ -79,14 +115,19 @@ namespace xmgr {
 				std::string value;
 				switch (nType)
 				{
+				case SQLITE_NULL:
+				{
+					value = "";
+					break;
+				}
 				case SQLITE_BLOB:
 				{
-					value = toHexString(std::string((char*)pReadBlobData, nLength));
+					value = pReadBlobData ? toHexString(std::string((char*)pReadBlobData, nLength)) : "";
 					break;
 				}
 				default:
 				{
-					value = std::string((char*)pReadBlobData, nLength);
+					value = pReadBlobData ? std::string((char*)pReadBlobData, nLength) : "";
 					break;
 				}
 				}
@@ -183,38 +224,62 @@ namespace xmgr {
 	}
 
 	const std::map<std::string, LPVOID>& DatabaseMgr::searchDatabases() {
+		SetDbDebug("searchDatabases begin");
 		std::lock_guard<std::mutex> lg(m_searchDbMtx);
 		if (!g_IsLogin) {
+			SetDbDebug("searchDatabases not login");
 			m_dbs.clear();
 			return m_dbs;
 		}
+		SetDbDebug("searchDatabases validate cached");
 		for (auto& it : m_dbs) {
-			if (IsBadReadPtr(it.second, sizeof(LPVOID)) || m_sqlite3Rountines->errcode(it.second) == SQLITE_MISUSE) {
+			int cachedRc = SQLITE_MISUSE;
+			if (!SafeSqliteErrcode(m_sqlite3Rountines, it.second, cachedRc) || cachedRc == SQLITE_MISUSE) {
 				m_dbs.clear();
 				break;
 			}
 		}
 		if (m_dbs.size() > 0) {
+			SetDbDebug("searchDatabases cached ok");
 			return m_dbs;
 		}
 		std::vector<LPVOID> results;
 		size_t vfs_addr = (size_t)g_hWeixinDll + XWECHAT_SQLITE3_VFS_OFFSET;
+		SetDbDebug2("searchDatabases scan pattern", vfs_addr);
 		ScanPattern(GetCurrentProcess(), (BYTE*)&vfs_addr, sizeof(LPVOID), results);
+		SetDbDebug2("searchDatabases scan count", results.size());
 		for (size_t i = 0; i < results.size(); i++) {
 			auto result = results[i];
-			if (IsBadReadPtr(result, sizeof(LPVOID)) == 0) {
-				int rc = m_sqlite3Rountines->errcode(result);
+			SetDbDebug2("searchDatabases candidate", reinterpret_cast<size_t>(result));
+			int rc = SQLITE_MISUSE;
+			if (SafeSqliteErrcode(m_sqlite3Rountines, result, rc)) {
+				SetDbDebug2("searchDatabases errcode", static_cast<size_t>(rc));
 				if (rc == SQLITE_OK) {
-					nlohmann::ordered_json queryResult = execute(result, "PRAGMA database_list");
-					std::string dbpath = queryResult["data"][0]["file"].get<std::string>();
-					if (dbpath.empty())
+					try {
+						SetDbDebug("searchDatabases pragma begin");
+						nlohmann::ordered_json queryResult = execute(result, "PRAGMA database_list");
+						SetDbDebug("searchDatabases pragma ok");
+						if (!queryResult.contains("data") || !queryResult["data"].is_array() ||
+							queryResult["data"].empty() || !queryResult["data"][0].contains("file")) {
+							continue;
+						}
+						std::string dbpath = queryResult["data"][0]["file"].get<std::string>();
+						sprintf_s(g_DbDebugText, sizeof(g_DbDebugText), "searchDatabases dbpath: %s", dbpath.c_str());
+						if (dbpath.empty())
+							continue;
+						auto pos = dbpath.find_last_of("\\/");
+						std::string dbname = pos == std::string::npos ? dbpath : dbpath.substr(pos + 1);
+						if (!dbname.empty())
+							m_dbs[dbname] = result;
+					}
+					catch (...) {
+						SetDbDebug("searchDatabases candidate exception");
 						continue;
-					auto pos = dbpath.find_last_of("\\");
-					std::string dbname = dbpath.substr(pos + 1);
-					m_dbs[dbname] = result;
+					}
 				}
 			}
 		}
+		SetDbDebug2("searchDatabases done count", m_dbs.size());
 		return m_dbs;
 	}
 

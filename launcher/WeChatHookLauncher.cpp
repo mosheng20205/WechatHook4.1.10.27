@@ -26,7 +26,7 @@ static bool Start(std::wstring& err,DWORD& pid) {
   if(GetFileAttributesW(EXE)==INVALID_FILE_ATTRIBUTES){err=L"Weixin.exe not found";return false;}
   if(GetFileAttributesW(DLL)==INVALID_FILE_ATTRIBUTES){err=L"version.dll not found";return false;}
   pid=Existing(); if(pid)return Inject(pid,err);
-  STARTUPINFOW si{sizeof(si)}; PROCESS_INFORMATION pi{}; std::wstring cmd=std::wstring(L"\"")+EXE+L"\" StartPort=30001 CallBackURL=http://127.0.0.1:8080/callback";
+  STARTUPINFOW si{sizeof(si)}; PROCESS_INFORMATION pi{}; std::wstring cmd=std::wstring(L"\"")+EXE+L"\" StartPort=30001 RecvType=2 CallBackURL=\"http://127.0.0.1:8080/callback\"";
   if(!CreateProcessW(EXE,cmd.data(),nullptr,nullptr,FALSE,CREATE_SUSPENDED,nullptr,L"C:\\Program Files\\Tencent\\Weixin",&si,&pi)){err=L"CreateProcess failed "+std::to_wstring(GetLastError());return false;}
   pid=pi.dwProcessId; bool ok=Inject(pid,err); if(ok)ResumeThread(pi.hThread);else TerminateProcess(pi.hProcess,1);CloseHandle(pi.hThread);CloseHandle(pi.hProcess);return ok;
 }
@@ -37,4 +37,14 @@ static LRESULT CALLBACK WndProc(HWND w,UINT m,WPARAM wp,LPARAM lp){
   if(m==WM_DESTROY){PostQuitMessage(0);return 0;}return DefWindowProcW(w,m,wp,lp);
 }
 
-int WINAPI wWinMain(HINSTANCE h,HINSTANCE,LPWSTR,int show){WNDCLASSW c{};c.hInstance=h;c.lpfnWndProc=WndProc;c.lpszClassName=L"WeChatHookLauncher";c.hCursor=LoadCursorW(0,IDC_ARROW);RegisterClassW(&c);HWND w=CreateWindowW(c.lpszClassName,L"WeChat Hook Launcher",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,CW_USEDEFAULT,CW_USEDEFAULT,500,210,0,0,h,0);ShowWindow(w,show);MSG m;while(GetMessageW(&m,0,0,0)>0){TranslateMessage(&m);DispatchMessageW(&m);}return 0;}
+int WINAPI wWinMain(HINSTANCE h,HINSTANCE,LPWSTR cmdLine,int show){
+  // Headless mode for scripts/shortcuts: start WeChat and inject immediately.
+  // The existing GUI remains the default when no switch is supplied.
+  if (cmdLine && (wcsstr(cmdLine, L"--start") || wcsstr(cmdLine, L"/start"))) {
+    std::wstring err; DWORD pid = 0;
+    if (Start(err, pid)) return 0;
+    MessageBoxW(nullptr, (L"WeChat Hook Launcher failed: " + err).c_str(),
+                L"WeChat Hook Launcher", MB_OK | MB_ICONERROR);
+    return 1;
+  }
+  WNDCLASSW c{};c.hInstance=h;c.lpfnWndProc=WndProc;c.lpszClassName=L"WeChatHookLauncher";c.hCursor=LoadCursorW(0,IDC_ARROW);RegisterClassW(&c);HWND w=CreateWindowW(c.lpszClassName,L"WeChat Hook Launcher",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,CW_USEDEFAULT,CW_USEDEFAULT,500,210,0,0,h,0);ShowWindow(w,show);MSG m;while(GetMessageW(&m,0,0,0)>0){TranslateMessage(&m);DispatchMessageW(&m);}return 0;}

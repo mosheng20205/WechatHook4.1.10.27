@@ -5,6 +5,7 @@
 #include <cstring>
 #include "global.h"
 #include "tools.h"
+#include "db_mgr.h"
 
 #include "GetSelfProfile.h"
 
@@ -37,8 +38,42 @@ struct RuntimeProfile {
     std::string nickname;
     std::string phone;
     uint64_t object = 0;
+    std::string area;
+    std::string signature;
+    std::string avatar;
+    std::string smallAvatar;
+    int sex = 0;
     bool valid = false;
 };
+
+std::string SqlQuote(const std::string& value)
+{
+    std::string escaped("'");
+    for (char c : value) {
+        if (c == '\'') escaped.push_back('\'');
+        escaped.push_back(c);
+    }
+    escaped.push_back('\'');
+    return escaped;
+}
+
+void ReadDatabaseProfile(RuntimeProfile& profile)
+{
+    if (profile.accountId.empty()) return;
+    try {
+        const std::string sql = "SELECT Province,City,Signature,Sex,BigHeadImgUrl,SmallHeadImgUrl FROM Contact WHERE UserName=" + SqlQuote(profile.accountId) + " LIMIT 1";
+        auto result = xmgr::DatabaseMgr::getInstance().execute("MicroMsg.db", sql);
+        if (result.value("status", -1) != 0 || !result.contains("data") || !result["data"].is_array() || result["data"].empty()) return;
+        const auto& row = result["data"][0];
+        profile.area = row.value("Province", "");
+        const std::string city = row.value("City", "");
+        if (!city.empty()) { if (!profile.area.empty()) profile.area += ","; profile.area += city; }
+        profile.signature = row.value("Signature", "");
+        profile.avatar = row.value("BigHeadImgUrl", "");
+        profile.smallAvatar = row.value("SmallHeadImgUrl", "");
+        try { profile.sex = std::stoi(row.value("Sex", "0")); } catch (...) { profile.sex = 0; }
+    } catch (...) {}
+}
 
 RuntimeProfile ReadRuntimeProfile()
 {
@@ -78,13 +113,42 @@ void RegisterGetSelfProfile(httplib::Server& svr)
         {
         json resp;
 
-        const RuntimeProfile runtime = ReadRuntimeProfile();
+        RuntimeProfile runtime = ReadRuntimeProfile();
+        const bool loggedIn = g_IsLogin != 0;
+        if (!loggedIn) {
+            // Do not return data cached from a previous account/session.
+            resp["wxid"] = "";
+            resp["alias"] = "";
+            resp["nickname"] = "";
+            resp["email"] = "";
+            resp["qq"] = 0;
+            resp["phone"] = "";
+            resp["proiv"] = "";
+            resp["area"] = "";
+            resp["signinfo"] = "";
+            resp["avatar"] = "";
+            resp["small_avatar"] = "";
+            resp["sex"] = 0;
+            resp["profile_read_ok"] = false;
+            resp["profile_object"] = 0;
+            resp["profile_account_id"] = "";
+            resp["profile_nickname"] = "";
+            resp["profile_phone"] = "";
+            res.set_content(resp.dump(), "application/json; charset=utf-8");
+            return;
+        }
         if (runtime.valid) {
+            ReadDatabaseProfile(runtime);
             // The first field is the verified account identifier candidate.
             SelfInfo.wxid = runtime.accountId;
             SelfInfo.alias = runtime.accountId;
             SelfInfo.nickname = runtime.nickname;
             SelfInfo.phone = runtime.phone;
+            SelfInfo.area = runtime.area;
+            SelfInfo.signinfo = runtime.signature;
+            SelfInfo.avatar = runtime.avatar;
+            SelfInfo.small_avatar = runtime.smallAvatar;
+            SelfInfo.sex = runtime.sex;
         }
 
         resp["wxid"] = SelfInfo.wxid;
@@ -96,12 +160,15 @@ void RegisterGetSelfProfile(httplib::Server& svr)
             resp["proiv"] = SelfInfo.proiv;
             resp["area"] = SelfInfo.area;
         resp["signinfo"] = SelfInfo.signinfo;
+        resp["avatar"] = SelfInfo.avatar;
+        resp["small_avatar"] = SelfInfo.small_avatar;
+        resp["sex"] = SelfInfo.sex;
         resp["profile_read_ok"] = runtime.valid;
         resp["profile_object"] = runtime.object;
         resp["profile_account_id"] = runtime.accountId;
         resp["profile_nickname"] = runtime.nickname;
         resp["profile_phone"] = runtime.phone;
             
-            res.set_content(resp.dump(), "application/json");
+            res.set_content(resp.dump(), "application/json; charset=utf-8");
         });
 }
