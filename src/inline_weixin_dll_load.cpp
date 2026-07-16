@@ -2544,9 +2544,16 @@ static int Hook_SqliteBindText(sqlite3_stmt* stmt, int index, const char* text,
     CaptureSqliteDbHandleFromStmt(stmt);
     CaptureSqlText(text, nByte, g_SqliteLastBindText, g_SqliteInterestingBindText);
     RecordSqliteBindTrace("bind_text", stmt, index, text, nByte);
-    return g_OriginalSqliteBindText
+    const int rc = g_OriginalSqliteBindText
         ? g_OriginalSqliteBindText(stmt, index, text, nByte, destructor)
         : SQLITE_ERROR;
+    // Contact/profile pages often bind their lookup key and payload before
+    // stepping the statement.  Give a queued read a chance on this same
+    // SQLite worker thread instead of waiting for a later prepare/step call.
+    if (g_SqliteLastDbHandle)
+        TryProcessPendingContactQuery(reinterpret_cast<sqlite3*>(
+            static_cast<uintptr_t>(g_SqliteLastDbHandle)));
+    return rc;
 }
 
 static int Hook_SqliteBindText16(sqlite3_stmt* stmt, int index, const void* text,
@@ -2556,9 +2563,13 @@ static int Hook_SqliteBindText16(sqlite3_stmt* stmt, int index, const void* text
     CaptureSqliteDbHandleFromStmt(stmt);
     CaptureSqlText16(text, nByte, g_SqliteLastBindText, g_SqliteInterestingBindText);
     RecordSqliteBindTrace16("bind_text16", stmt, index, text, nByte);
-    return g_OriginalSqliteBindText16
+    const int rc = g_OriginalSqliteBindText16
         ? g_OriginalSqliteBindText16(stmt, index, text, nByte, destructor)
         : SQLITE_ERROR;
+    if (g_SqliteLastDbHandle)
+        TryProcessPendingContactQuery(reinterpret_cast<sqlite3*>(
+            static_cast<uintptr_t>(g_SqliteLastDbHandle)));
+    return rc;
 }
 
 static int Hook_SqliteStep(sqlite3_stmt* stmt)
