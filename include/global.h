@@ -136,6 +136,130 @@ extern volatile uint64_t g_ContactQueryClaims;
 extern volatile uint64_t g_ContactQueryExecuteCalls;
 extern volatile uint64_t g_ContactQueryCompleteCalls;
 extern volatile uint64_t g_ContactQueryLastDb;
+// Read-only observation of WeChat's contact response record parser
+// (Weixin.dll RVA 0x2704F70).  The hook only copies validated fields into
+// the bounded contact cache; it never calls back into WeChat.
+extern volatile uint64_t g_ContactParserCalls;
+extern volatile uint64_t g_ContactParserRows;
+extern volatile uint64_t g_ContactParserHookInstalled;
+extern volatile uint64_t g_ContactParserLastRecord;
+extern char g_ContactParserLastUsername[256];
+extern char g_ContactParserLastAlias[256];
+extern char g_ContactParserLastNickname[512];
+extern char g_ContactParserLastBigHeadUrl[1024];
+extern char g_ContactParserLastSmallHeadUrl[1024];
+// Read-only observation of the contact detail response branch
+// (Weixin.dll RVA 0x26B03B0).
+extern volatile uint64_t g_ContactDetailCalls;
+extern volatile uint64_t g_ContactDetailHookInstalled;
+extern volatile uint64_t g_ContactDetailLastManager;
+extern volatile uint64_t g_ContactDetailLastOutput;
+extern volatile uint64_t g_ContactDetailLastRequest;
+extern volatile uint64_t g_ContactDetailLastStatus;
+extern volatile uint64_t g_ContactDetailLastResult;
+extern volatile uint64_t g_ContactDetailRecordCalls;
+extern volatile uint64_t g_ContactDetailLastRecord;
+extern char g_ContactDetailLastUsername[256];
+extern char g_ContactDetailLastAlias[256];
+extern char g_ContactDetailLastNickname[512];
+// Read-only observation of the startup/login contact vector (RVA 0x26AC150).
+// The vector contains 1080-byte contact records before WeChat folds them into
+// its in-memory cache/tree.
+extern volatile uint64_t g_ContactStartupCalls;
+extern volatile uint64_t g_ContactStartupRecords;
+extern volatile uint64_t g_ContactStartupHookInstalled;
+extern volatile uint64_t g_ContactStartupLastVector;
+extern volatile uint64_t g_ContactStartupLastCount;
+extern char g_ContactStartupLastUsername[256];
+extern char g_ContactStartupLastAlias[256];
+extern char g_ContactStartupLastNickname[512];
+// Read-only observation of the full contact-list response source
+// (Weixin.dll RVA 0x2CEC8B0).  The callback receives a vector of the same
+// 1080-byte Contact records that are later consumed by sub_182CF25E0.
+extern volatile uint64_t g_ContactListSourceCalls;
+extern volatile uint64_t g_ContactListSourceRecords;
+extern volatile uint64_t g_ContactListSourceHookInstalled;
+extern volatile uint64_t g_ContactListSourceLastVector;
+extern volatile uint64_t g_ContactListSourceLastCount;
+extern char g_ContactListSourceLastUsername[256];
+extern char g_ContactListSourceLastAlias[256];
+extern char g_ContactListSourceLastNickname[512];
+// Read-only observation of sub_182CF25E0, the contact response task that
+// splits the server response into 1080-byte contact vectors.
+extern volatile uint64_t g_ContactResponseBatchCalls;
+extern volatile uint64_t g_ContactResponseBatchRecords;
+extern volatile uint64_t g_ContactResponseBatchHookInstalled;
+extern volatile uint64_t g_ContactResponseBatchLastVector;
+extern volatile uint64_t g_ContactResponseBatchLastCount;
+extern volatile uint64_t g_ContactResponseSplitCalls;
+extern volatile uint64_t g_ContactResponseSplitRecords;
+extern volatile uint64_t g_ContactResponseSplitHookInstalled;
+extern volatile uint64_t g_ContactResponseSplitLastInputCount;
+extern volatile uint64_t g_ContactResponseSplitLastOutputCount;
+extern volatile uint64_t g_ContactPipelineCalls;
+extern volatile uint64_t g_ContactPipelineRecords;
+extern volatile uint64_t g_ContactPipelineHookInstalled;
+extern volatile uint64_t g_ContactPipelineLastCount;
+extern volatile uint64_t g_ContactRecordParserCalls;
+extern volatile uint64_t g_ContactRecordParserRows;
+extern volatile uint64_t g_ContactRecordParserHookInstalled;
+extern volatile uint64_t g_ContactManagerListCalls;
+extern volatile uint64_t g_ContactManagerListRecords;
+extern volatile uint64_t g_ContactManagerListHookInstalled;
+extern volatile uint64_t g_ContactManagerListLastCount;
+extern volatile uint64_t g_ContactManagerListLastVector;
+extern volatile uint64_t g_ContactManagerListLastBegin;
+extern volatile uint64_t g_ContactManagerListLastEnd;
+extern volatile uint64_t g_ContactManagerListLastSpan;
+extern volatile uint64_t g_ContactManagerListLastMode;
+extern volatile uint64_t g_ContactManagerListLastCaller;
+extern volatile uint64_t g_ContactManagerListMaxCount;
+extern char g_ContactManagerListLastUsername[256];
+// Read-only observation of sub_180F73660, the startup contact-sync source
+// that prepares the username vector before CoGetContactListByCgi.
+extern volatile uint64_t g_ContactSyncSourceCalls;
+extern volatile uint64_t g_ContactSyncSourceItems;
+extern volatile uint64_t g_ContactSyncSourceHookInstalled;
+extern volatile uint64_t g_ContactSyncSourceLastVector;
+extern volatile uint64_t g_ContactSyncSourceLastCount;
+extern char g_ContactSyncSourceFirstUsername[256];
+extern char g_ContactSyncSourceLastUsername[256];
+extern volatile uint64_t g_ContactSyncCallbackCalls;
+extern volatile uint64_t g_ContactSyncCallbackRecords;
+extern volatile uint64_t g_ContactSyncCallbackHookInstalled;
+extern volatile uint64_t g_ContactSyncCallbackLastCount;
+extern volatile uint64_t g_ContactSyncCallbackLastVector;
+extern char g_ContactSyncCallbackFirstUsername[256];
+extern char g_ContactSyncCallbackLastUsername[256];
+extern volatile uint64_t g_ContactListBuildCalls;
+extern volatile uint64_t g_ContactListBuildRecords;
+extern volatile uint64_t g_ContactListBuildHookInstalled;
+extern volatile uint64_t g_ContactListBuildLastCount;
+extern volatile uint64_t g_ContactListBuildLastVector;
+extern char g_ContactListBuildFirstUsername[256];
+extern char g_ContactListBuildLastUsername[256];
+extern volatile uint64_t g_ContactSessionInfoCalls;
+extern volatile uint64_t g_ContactSessionInfoItems;
+extern volatile uint64_t g_ContactSessionInfoHookInstalled;
+extern volatile uint64_t g_ContactSessionInfoLastCount;
+extern volatile uint64_t g_ContactSessionInfoLastVector;
+extern char g_ContactSessionInfoFirstUsername[256];
+extern char g_ContactSessionInfoLastUsername[256];
+// Read-only observation of the general contact DB response engine
+// (Weixin.dll RVA 0x26E3330).  The row callback is wrapped only to count
+// 344-byte response rows and copy bounded diagnostic strings.
+extern volatile uint64_t g_ContactGeneralQueryCalls;
+extern volatile uint64_t g_ContactGeneralQueryRows;
+extern volatile uint64_t g_ContactGeneralQueryHookInstalled;
+extern volatile uint64_t g_ContactGeneralQueryLastRow;
+extern char g_ContactGeneralQueryLastField0[256];
+extern char g_ContactGeneralQueryLastField1[256];
+extern char g_ContactGeneralQueryLastField2[256];
+extern char g_ContactGeneralQueryLastField3[256];
+extern char g_ContactGeneralQueryLastField4[256];
+extern char g_ContactGeneralQueryLastField5[256];
+extern char g_ContactGeneralQueryLastField6[256];
+extern char g_ContactGeneralQueryLastField7[256];
 extern char g_SqliteLastSql[4096];
 extern char g_SqliteInterestingSql[4096];
 extern char g_SqliteLastBindText[4096];
@@ -203,6 +327,9 @@ extern volatile uint64_t g_ProfileObject;
 extern volatile uint64_t g_ProfileFieldCalls;
 extern volatile uint64_t g_ProfileFieldObject;
 extern volatile uint64_t g_ProfileFieldDescriptor;
+extern volatile uint64_t g_ProfileLookupCalls;
+extern char g_ProfileLookupLastKey[128];
+extern char g_ProfileLookupLastValue[1024];
 extern volatile uint64_t g_ProfileContainer830Calls;
 extern volatile uint64_t g_ProfileContainer830Object;
 extern volatile uint64_t g_ProfileContainer830Root;

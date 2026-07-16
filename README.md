@@ -1,56 +1,144 @@
 # WeChat-Hook 4.1.10.27
 
-适用于微信 PC `4.1.10.27` 的 Hook 项目。
+适用于微信 PC `4.1.10.27` 的 Hook 项目，提供联系人查询、实时文本消息接收、文本发送、自动回复和运行状态诊断等 HTTP 接口。
 
-WX4.1.10.27下载：https://pan.xunlei.com/s/VOxe0zLuEvSwlE86aYZcNCmSA1?pwd=vkkf
+微信 4.1.10.27 下载地址：<https://pan.xunlei.com/s/VOxe0zLuEvSwlE86aYZcNCmSA1?pwd=vkkf>
 
-## 快速启动
+> 偏移仅适用于微信 `4.1.10.27`。升级微信前必须重新验证偏移并完成真实进程回归测试。
 
-编译 `x64_Version_dll.vcxproj` 和 `launcher/WeChatHookLauncher.vcxproj` 后，使用命令行启动：
+## 已验证能力
+
+- `/GetContacts`：返回联系人全量快照，包含昵称、别名、头像、拼音等 Contact 表字段。
+- `/GetContact`：按 wxid 查询单个联系人；不存在时安全返回 `404`。
+- `/GetSelfProfile`：返回当前账号的 wxid、别名、昵称和手机号。
+- 实时普通文本接收：提取发送者 wxid、接收者 wxid 和正文。
+- `/SendTextMsg`：完成登录保护、发送请求入队和异步发送。
+- 好友和群聊自动回复：均已完成真实消息端到端验证。
+- `/QueryDB/status`：返回登录状态、消息观察、联系人和自动回复诊断计数。
+- `/QueryDB/GetAllDBName`：返回 SQLite Hook 捕获的联系人数据库，不扫描进程内存。
+
+联系人全量接口已在真实微信进程中验证：返回 `count = 66`、`complete = true`，66 条记录均包含 `nick_name` 和 `big_head_url`；微信主进程保持响应，未出现崩溃或异常内存增长。
+
+## 编译与启动
+
+编译以下项目：
+
+- `x64_Version_dll.vcxproj`
+- `launcher/WeChatHookLauncher.vcxproj`
+
+然后启动微信并注入 DLL：
 
 ```powershell
 .\launcher\bin\WeChatHookLauncher.exe --start
 ```
 
-启动器会启动微信、注入 `version.dll`，并开启 30001 端口。
+启动器会加载 `version.dll`，HTTP 服务默认监听 `127.0.0.1:30001`。
 
-## 接口状态总览
+## HTTP 接口
 
 ```http
 GET  http://127.0.0.1:30001/
 GET  http://127.0.0.1:30001/QueryDB/status
-POST http://127.0.0.1:30001/GetSelfProfile
+GET  http://127.0.0.1:30001/GetContacts
+POST http://127.0.0.1:30001/GetContacts
 POST http://127.0.0.1:30001/GetContact
+POST http://127.0.0.1:30001/GetSelfProfile
 POST http://127.0.0.1:30001/SendTextMsg
+POST http://127.0.0.1:30001/AutoReply/config
 POST http://127.0.0.1:30001/QueryDB/GetAllDBName
 POST http://127.0.0.1:30001/QueryDB/execute
 POST http://127.0.0.1:30001/SendImgMsg
 POST http://127.0.0.1:30001/ForwardXMLMsg
 POST http://127.0.0.1:30001/Decode_Pic
-POST http://127.0.0.1:30001/AutoReply/config
 ```
 
-已通过真实微信进程验证：
+### 获取全部联系人
 
-- `/`：HTTP 服务健康检查。
-- `/QueryDB/status`：返回登录状态、状态来源、状态切换次数、消息观察和自动回复计数。
-- `/GetSelfProfile`：真实返回 `wxid`、`alias`、`nickname`、`phone`；未登录时返回 `profile_read_ok=false`，不会返回上一会话缓存。
-- `/GetContact`：曾在真实微信进程中成功返回联系人 `username`、`nick_name`、`alias`、头像地址等字段；不存在的 wxid 返回 `status=404`，不崩溃。该接口依赖微信自己的 SQLite 线程，微信空闲时可能返回 `-504 timeout`，因此不保证空闲状态下立即成功。
-- `/SendTextMsg`：已验证登录保护和发送请求入队；未登录返回 `ret=-2`，入队成功返回 `ret=0`。本次真实跨账号消息测试还确认了同一发送链路的好友自动回复：入队 1 次、发送成功 1 次、失败 0 次。接口返回本地入队结果，不等同于微信服务端送达回执。
-- `/QueryDB/GetAllDBName`：真实运行返回由 SQLite Hook 捕获的 `MicroMsg.db` 句柄；不扫描进程内存。
-- `/AutoReply/config`：真实验证参数校验及开启/关闭；群聊自动回复默认关闭，使用 `{"group_enabled":true}` 显式开启。
-- 普通文本接收：真实收到 `TEST_PROFILE_DB123`，拆分出发送者 `wxid_orly2zssd5e112`、接收者 `wxid_ip31nye3qygp22` 和正文；消息被识别为好友消息并触发自动回复。
+`/GetContacts` 支持 GET 和 POST。POST 可传入分页参数；默认 `offset = 0`、`limit = 4096`，单次 `limit` 最大为 4096。
 
-本次真实运行的自动回复计数为：`AutoReplyCandidates=1`、`AutoReplyFriendCandidates=1`、`AutoReplyQueued=1`、`AutoReplySent=1`、`AutoReplyFailed=0`。微信主进程及其相关进程均保持响应，未出现崩溃或异常内存增长。
+```powershell
+Invoke-RestMethod `
+  -Uri 'http://127.0.0.1:30001/GetContacts' `
+  -Method Post `
+  -ContentType 'application/json' `
+  -Body '{"offset":0,"limit":100}'
+```
 
-个人资料的 `area`、`signinfo`、`avatar`、`small_avatar`、`sex` 字段目前通过 Contact 表尝试读取，但本次运行仍为空；不会使用猜测偏移填充。联系人查询和历史消息查询可以使用 SQLite，但 SQLite 不作为实时消息接收入口。
+响应示例：
 
-详细的版本适配笔记：
+```json
+{
+  "status": 0,
+  "contacts": [
+    {
+      "username": "wxid_example",
+      "nick_name": "示例昵称",
+      "alias": "example",
+      "big_head_url": "https://wx.qlogo.cn/...",
+      "small_head_url": "https://wx.qlogo.cn/...",
+      "quan_pin": "shilinicheng"
+    }
+  ],
+  "offset": 0,
+  "limit": 100,
+  "count": 66,
+  "complete": true,
+  "source": "wechat-contact-response-cache"
+}
+```
 
-- [登录状态笔记](docs/LOGIN_STATUS_NOTES_4.1.10.27.md)
-- [个人资料笔记](docs/SELF_PROFILE_NOTES_4.1.10.27.md)
-- [接收消息笔记](docs/RECEIVE_MESSAGE_NOTES_4.1.10.27.md)
-- [发送消息笔记](docs/SEND_MESSAGE_NOTES_4.1.10.27.md)
+实现要点：
+
+- 首次请求会把 `SELECT * FROM Contact` 只读查询排队到微信自己的 SQLite 工作线程。
+- HTTP 线程不会直接调用微信内部 SQLite 句柄。
+- 查询结果会合并进有界联系人缓存，退出登录时清空，切换账号后重新回填。
+- SQLite 线程未及时认领查询时，首次响应可能为 `complete: false`；后续请求会自动重试。
+- `count` 包含好友、群聊、公众号/服务号和陌生人等 Contact 全表条目，不等同于纯好友数量。
+
+部分大小写不敏感的 JSON 解析器可能把数据库原字段 `UserName` 和快照补充字段 `username` 视为重复键。这是解析器限制，建议使用大小写敏感的 JSON 解析器。
+
+详细实现和真机验证记录见 [GET_CONTACTS_NOTES.md](GET_CONTACTS_NOTES.md)。
+
+### 获取单个联系人
+
+```powershell
+Invoke-RestMethod `
+  -Uri 'http://127.0.0.1:30001/GetContact' `
+  -Method Post `
+  -ContentType 'application/json' `
+  -Body '{"wxid":"wxid_example"}'
+```
+
+该接口已验证可返回 `username`、`nick_name`、`alias`、`big_head_url`、`small_head_url`、`quan_pin` 等完整行数据。不存在的 wxid 返回 HTTP `404`，不会崩溃。
+
+### 自动回复
+
+`/AutoReply/config` 已验证参数校验和启停逻辑。群聊自动回复默认关闭，可显式开启：
+
+```powershell
+Invoke-RestMethod `
+  -Uri 'http://127.0.0.1:30001/AutoReply/config' `
+  -Method Post `
+  -ContentType 'application/json' `
+  -Body '{"enabled":true,"group_enabled":true}'
+```
+
+接收 Hook 只负责解析消息并入队；自动回复由独立工作线程调用发送接口，避免在消息 Hook 内重入微信发送逻辑。
+
+真实验证结果：
+
+- 好友消息：`AutoReplyCandidates=1`、`AutoReplyFriendCandidates=1`、`AutoReplyQueued=1`、`AutoReplySent=1`、`AutoReplyFailed=0`。
+- 群聊消息：`AutoReplyGroupCandidates=1`、`AutoReplyQueued=1`、`AutoReplySent=1`、`AutoReplyFailed=0`。
+
+`/SendTextMsg` 返回本地入队结果，不等同于微信服务端送达回执。
+
+### 数据库接口
+
+微信 4.1.10.27 的联系人数据库路径为 `db_storage\contact\contact.db`。Hook 同时兼容旧逻辑名 `MicroMsg.db`，并明确排除 `contact_fts.db`。
+
+- `/QueryDB/GetAllDBName` 已验证可返回捕获到的 `contact.db` 路径和句柄。
+- `/QueryDB/execute` 仅允许单条只读 SQL，并交由微信 SQLite 工作线程执行。
+- SQLite 仅用于联系人和历史消息查询，不作为实时消息接收入口。
 
 ## 自动化回归测试
 
@@ -61,48 +149,25 @@ powershell -ExecutionPolicy Bypass -File .\tools\test-api.ps1 -RequireLogin
 
 完整流程和状态字段说明见 [docs/STATUS_AND_TESTING.md](docs/STATUS_AND_TESTING.md)。
 
-## 当前完成情况
+## 当前限制
 
-已完成并实际验证：
+- `/SendImgMsg`、`/ForwardXMLMsg`、`/Decode_Pic`：4.1.10.27 的相关偏移尚未重新验证，目前会安全拒绝执行。
+- `/GetSelfProfile` 的 `area`、`signinfo`、`avatar`、`small_avatar`、`sex` 等可选字段仍可能为空，不会使用猜测偏移填充。
+- `/SendTextMsg` 已验证本地发送入队和自动回复链路，尚未单独实现微信服务端送达回执。
+- 多账号切换、退出后重新登录仍建议在发布前执行完整真实账号回归。
 
-- 命令行自动启动微信并注入 DLL
-- HTTP 服务自动启动和端口检查
-- 登录完成回调识别登录状态
-- `/QueryDB/status` 返回 `IsLogin`、状态来源和状态切换计数
-- 未登录时清理资料对象，不返回上一会话缓存
-- `/GetSelfProfile` 返回微信号、别名、昵称、手机号
-- `/GetContact` 在 SQLite 线程活跃时返回联系人资料，并对不存在的 wxid 安全返回
-- `/SendTextMsg` 完成登录检查和发送请求入队；好友自动回复已完成真实跨账号运行验证
-- `/QueryDB/GetAllDBName` 返回 SQLite Hook 捕获的 `MicroMsg.db`
-- 根路径健康检查 `/`
-- 普通文本接收、发送者 wxid/正文拆分和好友消息自动回复
-- UTF-8 JSON 响应头
-- 未登录和已登录自动化回归测试
+## 版本适配笔记
 
-尚未完成或仍需专项验证：
+- [联系人全量获取](GET_CONTACTS_NOTES.md)
+- [登录状态](docs/LOGIN_STATUS_NOTES_4.1.10.27.md)
+- [个人资料](docs/SELF_PROFILE_NOTES_4.1.10.27.md)
+- [接收消息](docs/RECEIVE_MESSAGE_NOTES_4.1.10.27.md)
+- [发送消息](docs/SEND_MESSAGE_NOTES_4.1.10.27.md)
 
-- 地区、签名、头像、性别等资料字段：尚未确认稳定的内存结构，当前可能为空
-- `LoginProbeCalls`：探针已安装，但该版本实际登录流程未调用当前候选函数，状态目前由登录完成回调确认
-- 退出登录后的动态回归：代码已清理状态，但还需要在真实账号上执行一次“登录 → 退出登录 → 重新登录”验证
-- 多账号切换和微信重启后的完整回归
-- 群聊自动回复和自身消息跳过：代码有分类计数，但尚未用真实群聊消息完成端到端验证
-- `/QueryDB/execute`：仅实现单条只读 SQL 的安全队列；空闲时真实查询会超时，尚未完成稳定成功验证
-- `/SendImgMsg`：已验证登录保护、文件校验和未验证偏移的安全拒绝；真实图片发送调用已禁用，直到重新定位 4.1.10.27 结构
-- `/ForwardXMLMsg`：已验证参数保护和未验证偏移的安全拒绝；真实 XML 发送调用已禁用，直到重新定位 4.1.10.27 结构
-- `/Decode_Pic`：已实现源文件和目标路径校验；对于有效文件也会安全返回“偏移未验证”，尚未验证真实加密图片解码
-- `/GetContact`：已有真实成功记录，但需要在微信 SQLite 线程活跃时触发；空闲超时问题仍需优化
-- `/SendTextMsg`：本地发送入队和自动回复链路已验证，尚未单独验证微信服务端送达回执
-- `/AutoReply/config`：配置接口已验证，但群聊开启后的真实回复仍需群聊消息和明确测试授权
-- SQLite Contact 行缓存：已实现并保持进程稳定，但当前测试未捕获到目标联系人行，尚未证明空闲时能命中缓存
+## 安全约束
 
-## 注意事项
-
-偏移仅适用于微信 `4.1.10.27`。地区、签名、头像、性别等尚未确认结构的字段不会使用猜测偏移读取；升级微信版本前应重新验证偏移和回归测试。
-## Latest runtime verification (WeChat 4.1.10.27)
-
-- The live SQLite layout uses `db_storage\\contact\\contact.db`; the hook recognizes this path as well as legacy `MicroMsg.db` and rejects `contact_fts.db`.
-- `/QueryDB/GetAllDBName` was verified to return the captured `contact.db` path and handle from the SQLite hook.
-- Group auto-reply was verified after a real inbound group message: `AutoReplyGroupCandidates=1`, `AutoReplyQueued=1`, `AutoReplySent=1`, `AutoReplyFailed=0`; target `18652463466@chatroom`, body `[auto-reply] wxid_orly2zssd5e112:\n11111`.
-- After rebuilding and reinjecting the DLL, WeChat remained responsive at about 255 MB working set with no crash.
-- `/GetContact` and `/QueryDB/execute` still require an active contact-database callback; idle requests time out and are not counted as successful verification. Optional profile fields remain empty.
-- `/SendImgMsg`, `/ForwardXMLMsg`, and `/Decode_Pic` continue to return the safety error for unverified 4.1.10.27 offsets.
+- 仅对已在 IDA 和真实运行时验证过的偏移安装 Hook。
+- Hook 必须透传原函数返回值。
+- 不在 HTTP 线程直接操作微信内部 SQLite 连接。
+- 不在消息接收 Hook 内重入发送函数。
+- 修改后需重新编译 DLL，并在微信重启、重新登录和真实消息测试后复核接口与计数器。

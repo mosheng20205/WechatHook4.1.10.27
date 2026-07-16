@@ -377,6 +377,1287 @@ static bool IsExecutablePointer(const void* ptr)
            protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
 }
 
+static size_t CopyNativeStringAt(int64_t object, size_t offset,
+                                 char* dst, size_t cap);
+static bool TryCopyNativeStringObject(int64_t object, char* dst, size_t cap);
+
+// Contact response records are produced by WeChat's own response parser at
+// RVA 0x2704F70.  Keep this observer deliberately read-only: call the
+// original first, then copy only bounded native-string fields from the
+// caller-owned 1080-byte record.  No WeChat routine is called from here.
+using FnContactResponseParser = int64_t(__fastcall*)(int64_t, int64_t, int64_t);
+static FnContactResponseParser g_OriginalContactResponseParser = nullptr;
+static LONG g_ContactResponseParserHookState = 0;
+
+static bool IsLikelyContactUsername(const char* text)
+{
+    if (!text)
+        return false;
+    size_t n = 0;
+    while (n < 255 && text[n])
+        ++n;
+    if (n < 3 || n >= 255)
+        return false;
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        if (c <= 0x20 || c == '\\' || c == '"')
+            return false;
+    }
+    return true;
+}
+
+static int64_t __fastcall Hook_ContactResponseParser(int64_t context,
+                                                     int64_t response,
+                                                     int64_t record)
+{
+    const int64_t result = g_OriginalContactResponseParser
+        ? g_OriginalContactResponseParser(context, response, record) : 0;
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactParserCalls));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactParserLastRecord),
+                          static_cast<LONG64>(record));
+
+    if (!result || !g_IsLogin || !record ||
+        !IsReadablePointer(reinterpret_cast<const void*>(record)))
+        return result;
+
+    char username[256]{};
+    char alias[256]{};
+    char nickname[512]{};
+    char quanPin[512]{};
+    char bigHeadUrl[1024]{};
+    char smallHeadUrl[1024]{};
+    char description[1024]{};
+    if (!CopyNativeStringAt(record, 8, username, sizeof(username)) ||
+        !IsLikelyContactUsername(username))
+        return result;
+
+    // Offsets are the fields written by sub_182704F70 for 4.1.10.27:
+    // username 0x08, alias 0x28, nickname 0xD8, quan_pin 0x118,
+    // big_head_url 0x138, small_head_url 0x158, description 0x1A0.
+    CopyNativeStringAt(record, 40, alias, sizeof(alias));
+    CopyNativeStringAt(record, 216, nickname, sizeof(nickname));
+    CopyNativeStringAt(record, 280, quanPin, sizeof(quanPin));
+    CopyNativeStringAt(record, 312, bigHeadUrl, sizeof(bigHeadUrl));
+    CopyNativeStringAt(record, 344, smallHeadUrl, sizeof(smallHeadUrl));
+    CopyNativeStringAt(record, 416, description, sizeof(description));
+
+    CopySafeText(username, g_ContactParserLastUsername,
+                 sizeof(g_ContactParserLastUsername));
+    CopySafeText(alias, g_ContactParserLastAlias,
+                 sizeof(g_ContactParserLastAlias));
+    CopySafeText(nickname, g_ContactParserLastNickname,
+                 sizeof(g_ContactParserLastNickname));
+    CopySafeText(bigHeadUrl, g_ContactParserLastBigHeadUrl,
+                 sizeof(g_ContactParserLastBigHeadUrl));
+    CopySafeText(smallHeadUrl, g_ContactParserLastSmallHeadUrl,
+                 sizeof(g_ContactParserLastSmallHeadUrl));
+
+    try {
+        json row = {
+            {"UserName", username},
+            {"Alias", alias},
+            {"NickName", nickname},
+            {"Nick_Name", nickname},
+            {"QuanPin", quanPin},
+            {"BigHeadImgUrl", bigHeadUrl},
+            {"SmallHeadImgUrl", smallHeadUrl},
+            {"Description", description}
+        };
+        RecordCapturedContactRow(username, row.dump());
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactParserRows));
+    } catch (...) {
+        // A cache allocation failure must never affect WeChat's parser.
+    }
+    return result;
+}
+
+static void InstallContactResponseParserHook()
+{
+    if (InterlockedCompareExchange(&g_ContactResponseParserHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x2704F70);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_ContactResponseParser),
+                      reinterpret_cast<void**>(&g_OriginalContactResponseParser)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        g_OriginalContactResponseParser = nullptr;
+        InterlockedExchange(&g_ContactResponseParserHookState, 0);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactParserHookInstalled), 0);
+        return;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactParserHookInstalled), 1);
+}
+
+// The detail-from-db branch inserts one 1080-byte Contact record at a time
+// through sub_1826D0DB0.  The source record is the value object at a3+8;
+// keep this observer read-only and reuse the already verified Contact layout.
+static bool CaptureContactDetailRecord(int64_t record)
+{
+    if (!g_IsLogin || !record || !IsReadablePointer(reinterpret_cast<const void*>(record)))
+        return false;
+
+    char username[256]{};
+    char alias[256]{};
+    char nickname[512]{};
+    char quanPin[512]{};
+    char bigHeadUrl[1024]{};
+    char smallHeadUrl[1024]{};
+    char description[1024]{};
+    if (!CopyNativeStringAt(record, 8, username, sizeof(username)) ||
+        !IsLikelyContactUsername(username))
+        return false;
+
+    CopyNativeStringAt(record, 40, alias, sizeof(alias));
+    CopyNativeStringAt(record, 216, nickname, sizeof(nickname));
+    CopyNativeStringAt(record, 280, quanPin, sizeof(quanPin));
+    CopyNativeStringAt(record, 312, bigHeadUrl, sizeof(bigHeadUrl));
+    CopyNativeStringAt(record, 344, smallHeadUrl, sizeof(smallHeadUrl));
+    CopyNativeStringAt(record, 416, description, sizeof(description));
+
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactDetailLastRecord),
+                          static_cast<LONG64>(record));
+    CopySafeText(username, g_ContactDetailLastUsername,
+                 sizeof(g_ContactDetailLastUsername));
+    CopySafeText(alias, g_ContactDetailLastAlias,
+                 sizeof(g_ContactDetailLastAlias));
+    CopySafeText(nickname, g_ContactDetailLastNickname,
+                 sizeof(g_ContactDetailLastNickname));
+    try {
+        json row = {
+            {"UserName", username},
+            {"Alias", alias},
+            {"NickName", nickname},
+            {"Nick_Name", nickname},
+            {"QuanPin", quanPin},
+            {"BigHeadImgUrl", bigHeadUrl},
+            {"SmallHeadImgUrl", smallHeadUrl},
+            {"Description", description}
+        };
+        RecordCapturedContactRow(username, row.dump());
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactDetailRecordCalls));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// At login/startup WeChat receives a contiguous vector of 1080-byte Contact
+// records and then folds it into the in-memory cache/tree.  Observe that
+// vector before the original routine destroys the temporary records.  This
+// hook is deliberately read-only and does not call any WeChat routine.
+static bool CaptureStartupContactRecord(int64_t record)
+{
+    if (!record || !IsReadablePointer(reinterpret_cast<const void*>(record)))
+        return false;
+
+    char username[256]{};
+    char alias[256]{};
+    char nickname[512]{};
+    char quanPin[512]{};
+    char bigHeadUrl[1024]{};
+    char smallHeadUrl[1024]{};
+    char description[1024]{};
+    if (!CopyNativeStringAt(record, 8, username, sizeof(username)) ||
+        !IsLikelyContactUsername(username))
+        return false;
+
+    CopyNativeStringAt(record, 40, alias, sizeof(alias));
+    CopyNativeStringAt(record, 216, nickname, sizeof(nickname));
+    CopyNativeStringAt(record, 280, quanPin, sizeof(quanPin));
+    CopyNativeStringAt(record, 312, bigHeadUrl, sizeof(bigHeadUrl));
+    CopyNativeStringAt(record, 344, smallHeadUrl, sizeof(smallHeadUrl));
+    CopyNativeStringAt(record, 416, description, sizeof(description));
+
+    CopySafeText(username, g_ContactStartupLastUsername,
+                 sizeof(g_ContactStartupLastUsername));
+    CopySafeText(alias, g_ContactStartupLastAlias,
+                 sizeof(g_ContactStartupLastAlias));
+    CopySafeText(nickname, g_ContactStartupLastNickname,
+                 sizeof(g_ContactStartupLastNickname));
+    try {
+        json row = {
+            {"UserName", username},
+            {"Alias", alias},
+            {"NickName", nickname},
+            {"Nick_Name", nickname},
+            {"QuanPin", quanPin},
+            {"BigHeadImgUrl", bigHeadUrl},
+            {"SmallHeadImgUrl", smallHeadUrl},
+            {"Description", description}
+        };
+        RecordCapturedContactRow(username, row.dump());
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactStartupRecords));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+using FnContactStartupVector = int64_t(__fastcall*)(int64_t, int64_t*, char);
+static FnContactStartupVector g_OriginalContactStartupVector = nullptr;
+static LONG g_ContactStartupHookState = 0;
+
+static int64_t __fastcall Hook_ContactStartupVector(int64_t manager,
+                                                    int64_t* records,
+                                                    char mode)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactStartupCalls));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactStartupLastVector),
+                          reinterpret_cast<LONG64>(records));
+
+    uint64_t count = 0;
+    __try {
+        if (records && IsReadablePointer(records) &&
+            IsReadablePointer(records + 1)) {
+            const int64_t begin = records[0];
+            const int64_t end = records[1];
+            if (begin && end >= begin &&
+                static_cast<uint64_t>(end - begin) % 1080u == 0) {
+                count = static_cast<uint64_t>(end - begin) / 1080u;
+                // A normal contact sync is bounded; reject corrupt ranges
+                // before walking caller-owned memory.
+                if (count <= 4096 &&
+                    IsReadablePointer(reinterpret_cast<const void*>(begin)) &&
+                    IsReadablePointer(reinterpret_cast<const void*>(end - 1))) {
+                    for (uint64_t i = 0; i < count; ++i) {
+                        const int64_t record = begin + static_cast<int64_t>(i * 1080u);
+                        if (!CaptureStartupContactRecord(record))
+                            continue;
+                    }
+                } else {
+                    count = 0;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        count = 0;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactStartupLastCount),
+                          static_cast<LONG64>(count));
+
+    return g_OriginalContactStartupVector
+        ? g_OriginalContactStartupVector(manager, records, mode) : 0;
+}
+
+static void InstallContactStartupVectorHook()
+{
+    if (InterlockedCompareExchange(&g_ContactStartupHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x26AC150);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_ContactStartupVector),
+                      reinterpret_cast<void**>(&g_OriginalContactStartupVector)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        g_OriginalContactStartupVector = nullptr;
+        InterlockedExchange(&g_ContactStartupHookState, 0);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactStartupHookInstalled), 0);
+        return;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactStartupHookInstalled), 1);
+}
+
+// sub_1826AC5A0 receives the list vector that sub_1826D2C60 walks with a
+// 1080-byte stride before constructing the contact UI/cache nodes. Observe
+// this vector without changing ownership or the callback arguments.
+using FnContactListBuild = int64_t(__fastcall*)(
+    int64_t, int64_t*, int64_t, int64_t, int64_t, int32_t, char);
+static FnContactListBuild g_OriginalContactListBuild = nullptr;
+static LONG g_ContactListBuildHookState = 0;
+
+static int64_t __fastcall Hook_ContactListBuild(int64_t owner,
+                                                 int64_t* records,
+                                                 int64_t context,
+                                                 int64_t callback,
+                                                 int64_t arg5,
+                                                 int32_t arg6,
+                                                 char arg7)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactListBuildCalls));
+    uint64_t count = 0;
+    __try {
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactListBuildLastVector),
+                              reinterpret_cast<LONG64>(records));
+        char first[256]{};
+        char last[256]{};
+        if (records && IsReadablePointer(records) && IsReadablePointer(records + 1)) {
+            const int64_t begin = records[0];
+            const int64_t end = records[1];
+            if (begin && end >= begin &&
+                static_cast<uint64_t>(end - begin) % 1080u == 0) {
+                count = static_cast<uint64_t>(end - begin) / 1080u;
+                if (count <= 4096 &&
+                    IsReadablePointer(reinterpret_cast<const void*>(begin)) &&
+                    IsReadablePointer(reinterpret_cast<const void*>(end - 1))) {
+                    for (uint64_t i = 0; i < count; ++i) {
+                        const int64_t record = begin + static_cast<int64_t>(i * 1080u);
+                        char username[256]{};
+                        if (!CopyNativeStringAt(record, 8, username, sizeof(username)) ||
+                            !IsLikelyContactUsername(username))
+                            continue;
+                        if (first[0] == 0)
+                            CopySafeText(username, first, sizeof(first));
+                        CopySafeText(username, last, sizeof(last));
+                        CaptureStartupContactRecord(record);
+                        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactListBuildRecords));
+                    }
+                    CopySafeText(first, g_ContactListBuildFirstUsername,
+                                 sizeof(g_ContactListBuildFirstUsername));
+                    CopySafeText(last, g_ContactListBuildLastUsername,
+                                 sizeof(g_ContactListBuildLastUsername));
+                } else {
+                    count = 0;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        count = 0;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactListBuildLastCount),
+                          static_cast<LONG64>(count));
+    return g_OriginalContactListBuild
+        ? g_OriginalContactListBuild(owner, records, context, callback, arg5, arg6, arg7) : 0;
+}
+
+static void InstallContactListBuildHook()
+{
+    if (InterlockedCompareExchange(&g_ContactListBuildHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x26AC5A0);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_ContactListBuild),
+                      reinterpret_cast<void**>(&g_OriginalContactListBuild)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        g_OriginalContactListBuild = nullptr;
+        InterlockedExchange(&g_ContactListBuildHookState, 0);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactListBuildHookInstalled), 0);
+        return;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactListBuildHookInstalled), 1);
+}
+
+// sub_182CF90A0 is the LoginFlow GetSessionInfoByUsernameList path. The
+// input object owns a 32-byte native-string vector at +0x38/+0x40. Observe
+// only its bounded username list and preserve the original call unchanged.
+using FnContactSessionInfo = int64_t(__fastcall*)(int64_t);
+static FnContactSessionInfo g_OriginalContactSessionInfo = nullptr;
+static LONG g_ContactSessionInfoHookState = 0;
+
+// Keep C++ exception handling outside the SEH-protected hook body.  The
+// snapshot is best-effort and must never affect the original login flow.
+static void CacheContactSessionUsername(const char* username)
+{
+    if (!username || !username[0])
+        return;
+    try {
+        json row = {
+            {"UserName", username},
+            {"username", username},
+            {"wxid", username},
+            {"source", "login-session-info"}
+        };
+        RecordCapturedContactRow(username, row.dump());
+    } catch (...) {
+        // Snapshot caching must never affect WeChat's call.
+    }
+}
+
+static int64_t __fastcall Hook_ContactSessionInfo(int64_t context)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactSessionInfoCalls));
+    uint64_t count = 0;
+    __try {
+        const auto* base = reinterpret_cast<const int64_t*>(context);
+        const int64_t begin = base ? *reinterpret_cast<const int64_t*>(context + 56) : 0;
+        const int64_t end = base ? *reinterpret_cast<const int64_t*>(context + 64) : 0;
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactSessionInfoLastVector),
+                              static_cast<LONG64>(begin));
+        if (begin && end >= begin &&
+            static_cast<uint64_t>(end - begin) % 32u == 0) {
+            count = static_cast<uint64_t>(end - begin) / 32u;
+            if (count <= 16384 &&
+                IsReadablePointer(reinterpret_cast<const void*>(begin)) &&
+                IsReadablePointer(reinterpret_cast<const void*>(end - 1))) {
+                char first[256]{};
+                char last[256]{};
+                for (uint64_t i = 0; i < count; ++i) {
+                    char username[256]{};
+                    const int64_t item = begin + static_cast<int64_t>(i * 32u);
+                    if (!TryCopyNativeStringObject(item, username, sizeof(username)) ||
+                        !IsLikelyContactUsername(username))
+                        continue;
+                    if (first[0] == 0)
+                        CopySafeText(username, first, sizeof(first));
+                    CopySafeText(username, last, sizeof(last));
+                    CacheContactSessionUsername(username);
+                    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactSessionInfoItems));
+                }
+                CopySafeText(first, g_ContactSessionInfoFirstUsername,
+                             sizeof(g_ContactSessionInfoFirstUsername));
+                CopySafeText(last, g_ContactSessionInfoLastUsername,
+                             sizeof(g_ContactSessionInfoLastUsername));
+            } else {
+                count = 0;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        count = 0;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactSessionInfoLastCount),
+                          static_cast<LONG64>(count));
+    return g_OriginalContactSessionInfo
+        ? g_OriginalContactSessionInfo(context) : 0;
+}
+
+static void InstallContactSessionInfoHook()
+{
+    if (InterlockedCompareExchange(&g_ContactSessionInfoHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x2CF90A0);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_ContactSessionInfo),
+                      reinterpret_cast<void**>(&g_OriginalContactSessionInfo)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        g_OriginalContactSessionInfo = nullptr;
+        InterlockedExchange(&g_ContactSessionInfoHookState, 0);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactSessionInfoHookInstalled), 0);
+        return;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactSessionInfoHookInstalled), 1);
+}
+
+// sub_180CCD320 receives the complete 1080-byte Contact vector before it is
+// split/classified and passed to sub_1826C6A00/sub_1826AC150.  Observe this
+// pre-split vector so the cache can be populated from the full list.  The
+// hook is read-only and forwards every argument and the original return value.
+using FnContactPipeline = int64_t(__fastcall*)(int64_t, int64_t*, int32_t*, int64_t);
+static FnContactPipeline g_OriginalContactPipeline = nullptr;
+static LONG g_ContactPipelineHookState = 0;
+
+static int64_t __fastcall Hook_ContactPipeline(int64_t owner,
+                                                int64_t* records,
+                                                int32_t* stats,
+                                                int64_t context)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactPipelineCalls));
+    uint64_t count = 0;
+    __try {
+        if (records && IsReadablePointer(records) &&
+            IsReadablePointer(records + 1)) {
+            const int64_t begin = records[0];
+            const int64_t end = records[1];
+            if (begin && end >= begin &&
+                static_cast<uint64_t>(end - begin) % 1080u == 0) {
+                count = static_cast<uint64_t>(end - begin) / 1080u;
+                if (count <= 4096 &&
+                    IsReadablePointer(reinterpret_cast<const void*>(begin)) &&
+                    IsReadablePointer(reinterpret_cast<const void*>(end - 1))) {
+                    for (uint64_t i = 0; i < count; ++i) {
+                        const int64_t record = begin + static_cast<int64_t>(i * 1080u);
+                        if (CaptureStartupContactRecord(record)) {
+                            InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactPipelineRecords));
+                        }
+                    }
+                } else {
+                    count = 0;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        count = 0;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactPipelineLastCount),
+                          static_cast<LONG64>(count));
+    return g_OriginalContactPipeline
+        ? g_OriginalContactPipeline(owner, records, stats, context) : 0;
+}
+
+static void InstallContactPipelineHook()
+{
+    if (InterlockedCompareExchange(&g_ContactPipelineHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x0CCD320);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_ContactPipeline),
+                      reinterpret_cast<void**>(&g_OriginalContactPipeline)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        g_OriginalContactPipeline = nullptr;
+        InterlockedExchange(&g_ContactPipelineHookState, 0);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactPipelineHookInstalled), 0);
+        return;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactPipelineHookInstalled), 1);
+}
+
+// sub_1826B0E00 parses a successful contact response and creates one local
+// 1080-byte record per item.  It delivers each record through its third
+// argument callback.  Wrap only that callback, capture the already validated
+// Contact fields, then call WeChat's callback unchanged.
+using FnContactRecordCallback = int64_t(__fastcall*)(int64_t);
+using FnContactRecordParser = int64_t(__fastcall*)(
+    int64_t, int64_t, FnContactRecordCallback, int64_t,
+    int64_t, int64_t, int64_t, int64_t);
+static FnContactRecordParser g_OriginalContactRecordParser = nullptr;
+static LONG g_ContactRecordParserHookState = 0;
+static thread_local FnContactRecordCallback g_ActiveContactRecordCallback = nullptr;
+
+static int64_t __fastcall Hook_ContactRecordCallback(int64_t record)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactRecordParserRows));
+    __try {
+        CaptureStartupContactRecord(record);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // A malformed response row must never affect WeChat's callback.
+    }
+    return g_ActiveContactRecordCallback
+        ? g_ActiveContactRecordCallback(record) : 0;
+}
+
+static int64_t __fastcall Hook_ContactRecordParser(
+    int64_t owner, int64_t request, FnContactRecordCallback callback,
+    int64_t arg4, int64_t arg5, int64_t arg6, int64_t arg7, int64_t arg8)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactRecordParserCalls));
+    const FnContactRecordCallback previous = g_ActiveContactRecordCallback;
+    g_ActiveContactRecordCallback = callback;
+    const int64_t result = g_OriginalContactRecordParser
+        ? g_OriginalContactRecordParser(owner, request,
+                                        callback ? &Hook_ContactRecordCallback : nullptr,
+                                        arg4, arg5, arg6, arg7, arg8)
+        : 0;
+    g_ActiveContactRecordCallback = previous;
+    return result;
+}
+
+static void InstallContactRecordParserHook()
+{
+    if (InterlockedCompareExchange(&g_ContactRecordParserHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x26B0E00);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_ContactRecordParser),
+                      reinterpret_cast<void**>(&g_OriginalContactRecordParser)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        g_OriginalContactRecordParser = nullptr;
+        InterlockedExchange(&g_ContactRecordParserHookState, 0);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactRecordParserHookInstalled), 0);
+        return;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactRecordParserHookInstalled), 1);
+}
+
+// sub_1826C6A00 selects manager+0x78 or manager+0x80 and passes the resulting
+// vector to sub_1826C6C10.  IDA's callee type confirms that the second
+// argument is a pointer to that vector; its elements are 1080-byte contact
+// records (the decompiler's `_QWORD* += 135` is 135 QWORDs, i.e. 1080 bytes).
+// The previous experiment incorrectly declared this argument as an int and
+// derived a vector from manager, which could corrupt the call ABI.
+// Keep this corrected observer read-only and forward the exact vector pointer.
+using FnContactManagerList = char(__fastcall*)(int64_t, int64_t*, char);
+static FnContactManagerList g_OriginalContactManagerList = nullptr;
+static LONG g_ContactManagerListHookState = 0;
+
+static char __fastcall Hook_ContactManagerList(int64_t manager,
+                                               int64_t* records,
+                                               char listMode)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactManagerListCalls));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactManagerListLastMode),
+                          static_cast<LONG64>(static_cast<unsigned char>(listMode)));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactManagerListLastCaller),
+                          static_cast<LONG64>(reinterpret_cast<uintptr_t>(_ReturnAddress())));
+    uint64_t count = 0;
+    __try {
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactManagerListLastVector),
+                              reinterpret_cast<LONG64>(records));
+        if (records && IsReadablePointer(records) && IsReadablePointer(records + 1)) {
+            const int64_t vectorAddress = reinterpret_cast<int64_t>(records);
+            auto* vector = reinterpret_cast<const int64_t*>(vectorAddress);
+            const int64_t begin = vector[0];
+            const int64_t end = vector[1];
+            InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactManagerListLastBegin),
+                                  static_cast<LONG64>(begin));
+            InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactManagerListLastEnd),
+                                  static_cast<LONG64>(end));
+            const uint64_t span = begin && end >= begin
+                ? static_cast<uint64_t>(end - begin) : 0;
+            InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactManagerListLastSpan),
+                                  static_cast<LONG64>(span));
+            if (begin && end >= begin &&
+                span % 1080u == 0) {
+                count = span / 1080u;
+                uint64_t oldMax = g_ContactManagerListMaxCount;
+                while (count > oldMax) {
+                    const uint64_t observed = static_cast<uint64_t>(InterlockedCompareExchange64(
+                        reinterpret_cast<volatile LONG64*>(&g_ContactManagerListMaxCount),
+                        static_cast<LONG64>(count), static_cast<LONG64>(oldMax)));
+                    if (observed == oldMax)
+                        break;
+                    oldMax = observed;
+                }
+                if (count <= 4096 &&
+                    IsReadablePointer(reinterpret_cast<const void*>(begin)) &&
+                    IsReadablePointer(reinterpret_cast<const void*>(end - 1))) {
+                    for (uint64_t i = 0; i < count; ++i) {
+                        const int64_t element = begin + static_cast<int64_t>(i * 1080u);
+                        char username[256]{};
+                        if (TryCopyNativeStringObject(element, username, sizeof(username)) &&
+                            IsLikelyContactUsername(username)) {
+                            CopySafeText(username, g_ContactManagerListLastUsername,
+                                         sizeof(g_ContactManagerListLastUsername));
+                            InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactManagerListRecords));
+                        }
+                    }
+                } else {
+                    count = 0;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        count = 0;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactManagerListLastCount),
+                           static_cast<LONG64>(count));
+    return g_OriginalContactManagerList
+        ? g_OriginalContactManagerList(manager, records, listMode) : 0;
+}
+
+static void InstallContactManagerListHook()
+{
+    if (InterlockedCompareExchange(&g_ContactManagerListHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x26C6A00);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_ContactManagerList),
+                      reinterpret_cast<void**>(&g_OriginalContactManagerList)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        g_OriginalContactManagerList = nullptr;
+        InterlockedExchange(&g_ContactManagerListHookState, 0);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactManagerListHookInstalled), 0);
+        return;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactManagerListHookInstalled), 1);
+}
+
+// sub_180F73660 is the startup contact-sync source identified in IDA by its
+// CoGetContactListByCgi request path.  The second argument is a vector of
+// 32-byte native strings; WeChat walks it before requesting contact records.
+// Observe only bounded usernames and always forward the original call.
+using FnContactSyncSource = int64_t(__fastcall*)(int64_t, int64_t*);
+static FnContactSyncSource g_OriginalContactSyncSource = nullptr;
+static LONG g_ContactSyncSourceHookState = 0;
+
+static int64_t __fastcall Hook_ContactSyncSource(int64_t owner, int64_t* items)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactSyncSourceCalls));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactSyncSourceLastVector),
+                          reinterpret_cast<LONG64>(items));
+
+    uint64_t count = 0;
+    __try {
+        if (items && IsReadablePointer(items) && IsReadablePointer(items + 1)) {
+            const int64_t begin = items[0];
+            const int64_t end = items[1];
+            if (begin && end >= begin &&
+                static_cast<uint64_t>(end - begin) % 32u == 0) {
+                count = static_cast<uint64_t>(end - begin) / 32u;
+                if (count <= 16384 &&
+                    IsReadablePointer(reinterpret_cast<const void*>(begin)) &&
+                    IsReadablePointer(reinterpret_cast<const void*>(end - 1))) {
+                    char first[256]{};
+                    char last[256]{};
+                    for (uint64_t i = 0; i < count; ++i) {
+                        char username[256]{};
+                        const int64_t element = begin + static_cast<int64_t>(i * 32u);
+                        if (!TryCopyNativeStringObject(element, username, sizeof(username)) ||
+                            !IsLikelyContactUsername(username)) {
+                            continue;
+                        }
+                        if (first[0] == 0)
+                            CopySafeText(username, first, sizeof(first));
+                        CopySafeText(username, last, sizeof(last));
+                        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactSyncSourceItems));
+                    }
+                    CopySafeText(first, g_ContactSyncSourceFirstUsername,
+                                 sizeof(g_ContactSyncSourceFirstUsername));
+                    CopySafeText(last, g_ContactSyncSourceLastUsername,
+                                 sizeof(g_ContactSyncSourceLastUsername));
+                } else {
+                    count = 0;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        count = 0;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactSyncSourceLastCount),
+                          static_cast<LONG64>(count));
+    return g_OriginalContactSyncSource
+        ? g_OriginalContactSyncSource(owner, items) : 0;
+}
+
+static void InstallContactSyncSourceHook()
+{
+    if (InterlockedCompareExchange(&g_ContactSyncSourceHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x0F73660);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_ContactSyncSource),
+                      reinterpret_cast<void**>(&g_OriginalContactSyncSource)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        g_OriginalContactSyncSource = nullptr;
+        InterlockedExchange(&g_ContactSyncSourceHookState, 0);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactSyncSourceHookInstalled), 0);
+        return;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactSyncSourceHookInstalled), 1);
+}
+
+// sub_182CEC8B0 is the async contact-list response entry.  Its third
+// argument is a vector of the same 1080-byte Contact records later split by
+// sub_182CF20C0 and consumed by sub_1826C6A00/sub_1826AC150.  Keep this hook
+// read-only: validate the vector bounds, copy bounded fields, then forward
+// the call unchanged.
+using FnContactListSource = int64_t(__fastcall*)(int64_t, int64_t, int64_t);
+static FnContactListSource g_OriginalContactListSource = nullptr;
+static LONG g_ContactListSourceHookState = 0;
+
+static bool CaptureContactListSourceRecord(int64_t record)
+{
+    if (!g_IsLogin || !record || !IsReadablePointer(reinterpret_cast<const void*>(record)))
+        return false;
+
+    char username[256]{};
+    char alias[256]{};
+    char nickname[512]{};
+    char quanPin[512]{};
+    char bigHeadUrl[1024]{};
+    char smallHeadUrl[1024]{};
+    char description[1024]{};
+    if (!CopyNativeStringAt(record, 8, username, sizeof(username)) ||
+        !IsLikelyContactUsername(username))
+        return false;
+
+    CopyNativeStringAt(record, 40, alias, sizeof(alias));
+    CopyNativeStringAt(record, 216, nickname, sizeof(nickname));
+    CopyNativeStringAt(record, 280, quanPin, sizeof(quanPin));
+    CopyNativeStringAt(record, 312, bigHeadUrl, sizeof(bigHeadUrl));
+    CopyNativeStringAt(record, 344, smallHeadUrl, sizeof(smallHeadUrl));
+    CopyNativeStringAt(record, 416, description, sizeof(description));
+
+    CopySafeText(username, g_ContactListSourceLastUsername,
+                 sizeof(g_ContactListSourceLastUsername));
+    CopySafeText(alias, g_ContactListSourceLastAlias,
+                 sizeof(g_ContactListSourceLastAlias));
+    CopySafeText(nickname, g_ContactListSourceLastNickname,
+                 sizeof(g_ContactListSourceLastNickname));
+    try {
+        json row = {
+            {"UserName", username},
+            {"Alias", alias},
+            {"NickName", nickname},
+            {"Nick_Name", nickname},
+            {"QuanPin", quanPin},
+            {"BigHeadImgUrl", bigHeadUrl},
+            {"SmallHeadImgUrl", smallHeadUrl},
+            {"Description", description}
+        };
+        RecordCapturedContactRow(username, row.dump());
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactListSourceRecords));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static int64_t __fastcall Hook_ContactListSource(int64_t owner,
+                                                  int64_t output,
+                                                  int64_t records)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactListSourceCalls));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactListSourceLastVector),
+                           static_cast<LONG64>(records));
+
+    uint64_t count = 0;
+    __try {
+        auto* vector = reinterpret_cast<const int64_t*>(records);
+        if (records && IsReadablePointer(vector) && IsReadablePointer(vector + 1)) {
+            const int64_t begin = vector[0];
+            const int64_t end = vector[1];
+            if (begin && end >= begin &&
+                static_cast<uint64_t>(end - begin) % 1080u == 0) {
+                count = static_cast<uint64_t>(end - begin) / 1080u;
+                if (count <= 4096 &&
+                    IsReadablePointer(reinterpret_cast<const void*>(begin)) &&
+                    IsReadablePointer(reinterpret_cast<const void*>(end - 1))) {
+                    for (uint64_t i = 0; i < count; ++i) {
+                        CaptureContactListSourceRecord(
+                            begin + static_cast<int64_t>(i * 1080u));
+                    }
+                } else {
+                    count = 0;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        count = 0;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactListSourceLastCount),
+                           static_cast<LONG64>(count));
+
+    return g_OriginalContactListSource
+        ? g_OriginalContactListSource(owner, output, records) : 0;
+}
+
+static void InstallContactListSourceHook()
+{
+    if (InterlockedCompareExchange(&g_ContactListSourceHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x2CEC8B0);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_ContactListSource),
+                      reinterpret_cast<void**>(&g_OriginalContactListSource)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        g_OriginalContactListSource = nullptr;
+        InterlockedExchange(&g_ContactListSourceHookState, 0);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactListSourceHookInstalled), 0);
+        return;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactListSourceHookInstalled), 1);
+}
+
+// sub_180F6E470 is the direct startup/contact-response callback. Its second
+// argument is forwarded as the 1080-byte record vector to sub_182CEC8B0.
+// Observe only bounded records and always forward the exact ABI/return value.
+using FnContactSyncCallback = int64_t(__fastcall*)(int64_t, int64_t*, char, char);
+static FnContactSyncCallback g_OriginalContactSyncCallback = nullptr;
+static LONG g_ContactSyncCallbackHookState = 0;
+
+static int64_t __fastcall Hook_ContactSyncCallback(int64_t owner,
+                                                    int64_t* records,
+                                                    char flag1,
+                                                    char flag2)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactSyncCallbackCalls));
+    uint64_t count = 0;
+    __try {
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactSyncCallbackLastVector),
+                              reinterpret_cast<LONG64>(records));
+        char first[256]{};
+        char last[256]{};
+        if (records && IsReadablePointer(records) && IsReadablePointer(records + 1)) {
+            const int64_t begin = records[0];
+            const int64_t end = records[1];
+            if (begin && end >= begin &&
+                static_cast<uint64_t>(end - begin) % 1080u == 0) {
+                count = static_cast<uint64_t>(end - begin) / 1080u;
+                if (count <= 4096 &&
+                    IsReadablePointer(reinterpret_cast<const void*>(begin)) &&
+                    IsReadablePointer(reinterpret_cast<const void*>(end - 1))) {
+                    for (uint64_t i = 0; i < count; ++i) {
+                        const int64_t record = begin + static_cast<int64_t>(i * 1080u);
+                        char username[256]{};
+                        if (!CopyNativeStringAt(record, 8, username, sizeof(username)) ||
+                            !IsLikelyContactUsername(username))
+                            continue;
+                        if (first[0] == 0)
+                            CopySafeText(username, first, sizeof(first));
+                        CopySafeText(username, last, sizeof(last));
+                        CaptureContactListSourceRecord(record);
+                        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactSyncCallbackRecords));
+                    }
+                    CopySafeText(first, g_ContactSyncCallbackFirstUsername,
+                                 sizeof(g_ContactSyncCallbackFirstUsername));
+                    CopySafeText(last, g_ContactSyncCallbackLastUsername,
+                                 sizeof(g_ContactSyncCallbackLastUsername));
+                } else {
+                    count = 0;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        count = 0;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactSyncCallbackLastCount),
+                          static_cast<LONG64>(count));
+    return g_OriginalContactSyncCallback
+        ? g_OriginalContactSyncCallback(owner, records, flag1, flag2) : 0;
+}
+
+static void InstallContactSyncCallbackHook()
+{
+    if (InterlockedCompareExchange(&g_ContactSyncCallbackHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x0F6E470);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_ContactSyncCallback),
+                      reinterpret_cast<void**>(&g_OriginalContactSyncCallback)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        g_OriginalContactSyncCallback = nullptr;
+        InterlockedExchange(&g_ContactSyncCallbackHookState, 0);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactSyncCallbackHookInstalled), 0);
+        return;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactSyncCallbackHookInstalled), 1);
+}
+
+// sub_182CF25E0 consumes the asynchronous contact response task.  IDA shows
+// its input vector at context+0x38/+0x40; it then splits that vector and calls
+// sub_1826C6A00/sub_1826AC150.  Observe the records before the original task
+// takes ownership.  This hook is intentionally read-only and forwards the
+// original return value unchanged.
+using FnContactResponseBatch = int64_t(__fastcall*)(int64_t);
+static FnContactResponseBatch g_OriginalContactResponseBatch = nullptr;
+static LONG g_ContactResponseBatchHookState = 0;
+
+static int64_t __fastcall Hook_ContactResponseBatch(int64_t context)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactResponseBatchCalls));
+    uint64_t count = 0;
+    int64_t lastVector = 0;
+    __try {
+        if (context && IsReadablePointer(reinterpret_cast<const void*>(context + 56)) &&
+            IsReadablePointer(reinterpret_cast<const void*>(context + 64))) {
+            const int64_t begin = *reinterpret_cast<const int64_t*>(context + 56);
+            const int64_t end = *reinterpret_cast<const int64_t*>(context + 64);
+            lastVector = begin;
+            if (begin && end > begin &&
+                static_cast<uint64_t>(end - begin) % 1080u == 0) {
+                count = static_cast<uint64_t>(end - begin) / 1080u;
+                if (count <= 4096 && IsReadablePointer(reinterpret_cast<const void*>(begin))) {
+                    for (uint64_t i = 0; i < count; ++i) {
+                        const int64_t record = begin + static_cast<int64_t>(i * 1080u);
+                        __try {
+                            if (CaptureStartupContactRecord(record))
+                                InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactResponseBatchRecords));
+                        } __except (EXCEPTION_EXECUTE_HANDLER) {
+                            // A malformed record is skipped without affecting
+                            // the response task or the remaining records.
+                        }
+                    }
+                } else {
+                    count = 0;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        count = 0;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactResponseBatchLastVector),
+                          static_cast<LONG64>(lastVector));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactResponseBatchLastCount),
+                          static_cast<LONG64>(count));
+    return g_OriginalContactResponseBatch
+        ? g_OriginalContactResponseBatch(context) : 0;
+}
+
+static void InstallContactResponseBatchHook()
+{
+    if (InterlockedCompareExchange(&g_ContactResponseBatchHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x2CF25E0);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_ContactResponseBatch),
+                      reinterpret_cast<void**>(&g_OriginalContactResponseBatch)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        g_OriginalContactResponseBatch = nullptr;
+        InterlockedExchange(&g_ContactResponseBatchHookState, 0);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactResponseBatchHookInstalled), 0);
+        return;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactResponseBatchHookInstalled), 1);
+}
+
+// sub_182CF20C0 converts the raw response vector into the two 1080-byte
+// vectors consumed by sub_1826C6A00/sub_1826AC150.  Capture the output only
+// after the original returns, while the caller still owns those vectors.
+using FnContactResponseSplit = uint64_t(__fastcall*)(int64_t*, int64_t*, int64_t*);
+static FnContactResponseSplit g_OriginalContactResponseSplit = nullptr;
+static LONG g_ContactResponseSplitHookState = 0;
+
+static uint64_t CountContactRecordVector(const int64_t* vector)
+{
+    if (!vector)
+        return 0;
+    __try {
+        if (!IsReadablePointer(vector) || !IsReadablePointer(vector + 1))
+            return 0;
+        const int64_t begin = vector[0];
+        const int64_t end = vector[1];
+        if (!begin || end <= begin ||
+            static_cast<uint64_t>(end - begin) % 1080u != 0)
+            return 0;
+        const uint64_t count = static_cast<uint64_t>(end - begin) / 1080u;
+        return count <= 4096 ? count : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+static uint64_t CaptureContactRecordVector(const int64_t* vector)
+{
+    const uint64_t count = CountContactRecordVector(vector);
+    if (!count)
+        return 0;
+    uint64_t captured = 0;
+    __try {
+        const int64_t begin = vector[0];
+        for (uint64_t i = 0; i < count; ++i) {
+            __try {
+                if (CaptureStartupContactRecord(begin + static_cast<int64_t>(i * 1080u)))
+                    ++captured;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return captured;
+}
+
+static uint64_t __fastcall Hook_ContactResponseSplit(int64_t* input,
+                                                      int64_t* output1,
+                                                      int64_t* output2)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactResponseSplitCalls));
+    const uint64_t inputCount = CountContactRecordVector(input);
+    const uint64_t output1Count = CountContactRecordVector(output1);
+    const uint64_t output2Count = CountContactRecordVector(output2);
+    const uint64_t outputCount = output1Count + output2Count;
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactResponseSplitLastInputCount),
+                          static_cast<LONG64>(inputCount));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactResponseSplitLastOutputCount),
+                          static_cast<LONG64>(outputCount));
+
+    const uint64_t result = g_OriginalContactResponseSplit
+        ? g_OriginalContactResponseSplit(input, output1, output2) : 0;
+    const uint64_t captured = CaptureContactRecordVector(output1) +
+                              CaptureContactRecordVector(output2);
+    InterlockedExchangeAdd64(reinterpret_cast<volatile LONG64*>(&g_ContactResponseSplitRecords),
+                              static_cast<LONG64>(captured));
+    return result;
+}
+
+static void InstallContactResponseSplitHook()
+{
+    if (InterlockedCompareExchange(&g_ContactResponseSplitHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x2CF20C0);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_ContactResponseSplit),
+                      reinterpret_cast<void**>(&g_OriginalContactResponseSplit)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        g_OriginalContactResponseSplit = nullptr;
+        InterlockedExchange(&g_ContactResponseSplitHookState, 0);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactResponseSplitHookInstalled), 0);
+        return;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactResponseSplitHookInstalled), 1);
+}
+
+// The generic "get contact from db" branch calls sub_1826E3330, which
+// materializes each result as a temporary 344-byte row and invokes a callback
+// (sub_180082060 is the identity callback for this path).  Observe the row
+// before forwarding it to the original callback.  The field meanings are not
+// assumed here; only bounded strings are copied for later runtime mapping.
+using FnContactGeneralRowCallback = int64_t(__fastcall*)(int64_t);
+using FnContactGeneralQueryEngine = int64_t(__fastcall*)(
+    int64_t, int64_t, FnContactGeneralRowCallback,
+    int64_t, int64_t, int64_t, int64_t, int64_t);
+static FnContactGeneralQueryEngine g_OriginalContactGeneralQueryEngine = nullptr;
+static LONG g_ContactGeneralQueryHookState = 0;
+static thread_local FnContactGeneralRowCallback g_ContactGeneralCurrentCallback = nullptr;
+
+static int64_t __fastcall Hook_ContactGeneralRow(int64_t row)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactGeneralQueryRows));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactGeneralQueryLastRow),
+                          static_cast<LONG64>(row));
+    if (row && IsReadablePointer(reinterpret_cast<const void*>(row))) {
+        char field0[256]{};
+        char field1[256]{};
+        char field2[256]{};
+        char field3[256]{};
+        char field4[256]{};
+        char field5[256]{};
+        char field6[256]{};
+        char field7[256]{};
+        // sub_1826E4360 moves the row's native-string members at these
+        // offsets into its 368-byte contact-cache node.  They are kept as
+        // diagnostics until runtime values establish their semantic names.
+        CopyNativeStringAt(row, 0x08, field0, sizeof(field0));
+        CopyNativeStringAt(row, 0x38, field1, sizeof(field1));
+        CopyNativeStringAt(row, 0x60, field2, sizeof(field2));
+        CopyNativeStringAt(row, 0x80, field3, sizeof(field3));
+        CopyNativeStringAt(row, 0xA8, field4, sizeof(field4));
+        CopyNativeStringAt(row, 0xC8, field5, sizeof(field5));
+        CopyNativeStringAt(row, 0xE8, field6, sizeof(field6));
+        CopyNativeStringAt(row, 0x108, field7, sizeof(field7));
+        CopySafeText(field0, g_ContactGeneralQueryLastField0,
+                     sizeof(g_ContactGeneralQueryLastField0));
+        CopySafeText(field1, g_ContactGeneralQueryLastField1,
+                     sizeof(g_ContactGeneralQueryLastField1));
+        CopySafeText(field2, g_ContactGeneralQueryLastField2,
+                     sizeof(g_ContactGeneralQueryLastField2));
+        CopySafeText(field3, g_ContactGeneralQueryLastField3,
+                     sizeof(g_ContactGeneralQueryLastField3));
+        CopySafeText(field4, g_ContactGeneralQueryLastField4,
+                     sizeof(g_ContactGeneralQueryLastField4));
+        CopySafeText(field5, g_ContactGeneralQueryLastField5,
+                     sizeof(g_ContactGeneralQueryLastField5));
+        CopySafeText(field6, g_ContactGeneralQueryLastField6,
+                     sizeof(g_ContactGeneralQueryLastField6));
+        CopySafeText(field7, g_ContactGeneralQueryLastField7,
+                     sizeof(g_ContactGeneralQueryLastField7));
+
+        // Runtime observation on 4.1.10.27 shows field0 is the username for
+        // this response branch (for example gh_b8ebf357de37), while field6
+        // carries an avatar URL when present.  Cache only those validated
+        // meanings and retain the remaining fields under diagnostic names;
+        // do not guess alias/nickname offsets from this temporary row.
+        if (IsLikelyContactUsername(field0)) {
+            try {
+                json cached = {
+                    {"UserName", field0},
+                    {"username", field0},
+                    {"wxid", field0},
+                    {"Field1", field1},
+                    {"Field2", field2},
+                    {"Field3", field3},
+                    {"Field4", field4},
+                    {"Field5", field5},
+                    {"Field6", field6},
+                    {"Field7", field7}
+                };
+                if (strncmp(field6, "http", 4) == 0) {
+                    cached["BigHeadImgUrl"] = field6;
+                    cached["SmallHeadImgUrl"] = field6;
+                }
+                RecordCapturedContactRow(field0, cached.dump());
+            } catch (...) {
+                // A diagnostic cache failure must never affect the original
+                // contact callback or its owning WeChat thread.
+            }
+        }
+    }
+    return g_ContactGeneralCurrentCallback
+        ? g_ContactGeneralCurrentCallback(row) : row;
+}
+
+static int64_t __fastcall Hook_ContactGeneralQueryEngine(
+    int64_t a1, int64_t a2, FnContactGeneralRowCallback callback,
+    int64_t a4, int64_t a5, int64_t a6, int64_t a7, int64_t a8)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactGeneralQueryCalls));
+    const FnContactGeneralRowCallback previous = g_ContactGeneralCurrentCallback;
+    g_ContactGeneralCurrentCallback = callback;
+    const int64_t result = g_OriginalContactGeneralQueryEngine
+        ? g_OriginalContactGeneralQueryEngine(a1, a2, &Hook_ContactGeneralRow,
+                                               a4, a5, a6, a7, a8)
+        : 0;
+    g_ContactGeneralCurrentCallback = previous;
+    return result;
+}
+
+static void InstallContactGeneralQueryHook()
+{
+    if (InterlockedCompareExchange(&g_ContactGeneralQueryHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x26E3330);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_ContactGeneralQueryEngine),
+                      reinterpret_cast<void**>(&g_OriginalContactGeneralQueryEngine)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        g_OriginalContactGeneralQueryEngine = nullptr;
+        InterlockedExchange(&g_ContactGeneralQueryHookState, 0);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactGeneralQueryHookInstalled), 0);
+        return;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactGeneralQueryHookInstalled), 1);
+}
+
+using FnContactDetailRecordInsert = int64_t(__fastcall*)(int64_t, int64_t,
+                                                          unsigned char*);
+static FnContactDetailRecordInsert g_OriginalContactDetailRecordInsert = nullptr;
+static LONG g_ContactDetailRecordHookState = 0;
+
+static int64_t __fastcall Hook_ContactDetailRecordInsert(int64_t object,
+                                                         int64_t result,
+                                                         unsigned char* node)
+{
+    const int64_t originalResult = g_OriginalContactDetailRecordInsert
+        ? g_OriginalContactDetailRecordInsert(object, result, node) : 0;
+    if (node) {
+        __try {
+            // sub_1826D0DB0 calls sub_18064ECB0(dst, node + 8), so node+8
+            // is the complete source Contact record.
+            CaptureContactDetailRecord(reinterpret_cast<int64_t>(node) + 8);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+    return originalResult;
+}
+
+static void InstallContactDetailRecordHook()
+{
+    if (InterlockedCompareExchange(&g_ContactDetailRecordHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x26D0DB0);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_ContactDetailRecordInsert),
+                      reinterpret_cast<void**>(&g_OriginalContactDetailRecordInsert)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        g_OriginalContactDetailRecordInsert = nullptr;
+        InterlockedExchange(&g_ContactDetailRecordHookState, 0);
+        return;
+    }
+}
+
+using FnContactDetail = int64_t(__fastcall*)(int64_t, int64_t, int64_t,
+                                              int64_t, char, unsigned char);
+static FnContactDetail g_OriginalContactDetail = nullptr;
+static LONG g_ContactDetailHookState = 0;
+
+static int64_t __fastcall Hook_ContactDetail(int64_t manager, int64_t output,
+                                              int64_t request, int64_t extra,
+                                              char flag, unsigned char mask)
+{
+    const int64_t result = g_OriginalContactDetail
+        ? g_OriginalContactDetail(manager, output, request, extra, flag, mask) : 0;
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactDetailCalls));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactDetailLastManager),
+                          static_cast<LONG64>(manager));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactDetailLastOutput),
+                          static_cast<LONG64>(output));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactDetailLastRequest),
+                          static_cast<LONG64>(request));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactDetailLastResult),
+                          static_cast<LONG64>(result));
+    uint64_t status = 0;
+    if (output) {
+        __try { status = *reinterpret_cast<const unsigned char*>(output + 64); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { status = 0; }
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactDetailLastStatus),
+                          static_cast<LONG64>(status));
+    return result;
+}
+
+static void InstallContactDetailHook()
+{
+    if (InterlockedCompareExchange(&g_ContactDetailHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x26B03B0);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_ContactDetail),
+                      reinterpret_cast<void**>(&g_OriginalContactDetail)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        g_OriginalContactDetail = nullptr;
+        InterlockedExchange(&g_ContactDetailHookState, 0);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactDetailHookInstalled), 0);
+        return;
+    }
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactDetailHookInstalled), 1);
+}
+
 static void CopySafeTextN(const char* src, int len, char* dst, size_t cap)
 {
     if (!dst || cap == 0)
@@ -664,12 +1945,16 @@ static void TryProcessPendingContactQuery(sqlite3* db)
         if (!g_ContactQueryActive || g_ContactQueryClaimed)
             return;
         if (g_SqliteContactDbHandle != 0 &&
-            reinterpret_cast<uint64_t>(db) != g_SqliteContactDbHandle &&
-            IdentifyMicroMsgDatabase(db) == 0) {
-            // WeChat may keep a pool of connections for the same
-            // contact\contact.db.  Accept every positively identified
-            // contact connection, but continue rejecting auxiliary DBs.
-            return;
+            reinterpret_cast<uint64_t>(db) != g_SqliteContactDbHandle) {
+            // WeChat may rotate connections while keeping the same contact
+            // worker thread.  Accept a new handle from that already observed
+            // thread; the schema check below still rejects auxiliary DBs.
+            const bool sameContactThread =
+                g_SqliteContactDbThreadId != 0 &&
+                static_cast<uint64_t>(GetCurrentThreadId()) ==
+                    g_SqliteContactDbThreadId;
+            if (!sameContactThread && IdentifyMicroMsgDatabase(db) == 0)
+                return;
         }
         if (g_ContactQueryGeneric) {
             const int databaseKind = IdentifyMicroMsgDatabase(db);
@@ -691,23 +1976,12 @@ static void TryProcessPendingContactQuery(sqlite3* db)
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactQueryExecuteCalls));
     nlohmann::ordered_json result;
     try {
-        if (!g_ContactQueryGeneric) {
-            // Verify the schema before issuing SELECT * FROM Contact.  This
-            // keeps wrong encrypted/FTS handles from producing noisy errors
-            // and lets the hook continue looking for the real MicroMsg.db
-            // connection on the next SQLite callback.
-            const auto schema = xmgr::DatabaseMgr::getInstance().execute(
-                db, "SELECT name FROM sqlite_master WHERE type='table' AND name='Contact' LIMIT 1");
-            const bool hasContact = schema.is_object() &&
-                schema.value("status", -1) == 0 &&
-                schema.contains("data") && schema["data"].is_array() &&
-                !schema["data"].empty();
-            if (!hasContact) {
-                std::lock_guard<std::mutex> lock(g_ContactQueryMutex);
-                g_ContactQueryClaimed = false;
-                return;
-            }
-        }
+        // The contact database in 4.1.10.27 is encrypted and some builds do
+        // not expose a reliable sqlite_master result through the wrapper.
+        // The handle was already captured from a Contact/ChatRoom statement
+        // on this SQLite worker thread, so a second schema probe is both
+        // redundant and capable of swallowing a valid query. Execute the
+        // requested read directly and propagate its concrete SQLite status.
         result = xmgr::DatabaseMgr::getInstance().execute(db, sql);
     } catch (const std::exception& e) {
         result = { {"status", -500}, {"desc", e.what()} };
@@ -2870,13 +4144,71 @@ static void InstallProfileContainerHooks()
     }
 }
 
+static void CopyProfileDescriptorKey(void* descriptor, char* dst, size_t cap)
+{
+    if (!dst || cap == 0)
+        return;
+    dst[0] = 0;
+    if (!descriptor)
+        return;
+    __try {
+        auto** vtable = *reinterpret_cast<uintptr_t***>(descriptor);
+        if (!vtable || !IsExecutablePointer(reinterpret_cast<const void*>(vtable[1])))
+            return;
+        using DescriptorKeyGetter = int64_t(__fastcall*)(void*);
+        const int64_t keyPtr = reinterpret_cast<DescriptorKeyGetter>(vtable[1])(descriptor);
+        if (!keyPtr || !IsReadablePointer(reinterpret_cast<const void*>(keyPtr)))
+            return;
+        const auto* text = reinterpret_cast<const unsigned char*>(keyPtr);
+        size_t n = 0;
+        while (n + 1 < cap) {
+            const unsigned char c = text[n];
+            if (c == 0)
+                break;
+            if (c < 0x20 || c > 0x7E) {
+                dst[0] = 0;
+                return;
+            }
+            dst[n++] = static_cast<char>(c);
+        }
+        dst[n] = 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        dst[0] = 0;
+    }
+}
+
 static void* __fastcall Hook_ProfileFieldRead(void* object, void* output, void* descriptor)
 {
+    // Capture the descriptor while its temporary key string is alive.  The
+    // original lookup may release that temporary before it returns.
+    char descriptorKey[sizeof(g_ProfileLookupLastKey)]{};
+    CopyProfileDescriptorKey(descriptor, descriptorKey, sizeof(descriptorKey));
     void* result = g_OriginalProfileFieldRead
         ? g_OriginalProfileFieldRead(object, output, descriptor)
         : nullptr;
     g_ProfileFieldObject = reinterpret_cast<uint64_t>(object);
     g_ProfileFieldDescriptor = reinterpret_cast<uint64_t>(descriptor);
+    CopySafeText(descriptorKey, g_ProfileLookupLastKey,
+                 sizeof(g_ProfileLookupLastKey));
+    g_ProfileLookupLastValue[0] = 0;
+    if (output) {
+        __try {
+            // Preserve a bounded, printable view of the first output bytes.
+            // The profile getter owns this object; no internal method is called.
+            const auto* bytes = reinterpret_cast<const unsigned char*>(output);
+            size_t n = 0;
+            for (size_t i = 0; i < 32 && n + 1 < sizeof(g_ProfileLookupLastValue); ++i) {
+                const unsigned char c = bytes[i];
+                if (c < 0x20 || c > 0x7E)
+                    break;
+                g_ProfileLookupLastValue[n++] = static_cast<char>(c);
+            }
+            g_ProfileLookupLastValue[n] = 0;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            g_ProfileLookupLastValue[0] = 0;
+        }
+    }
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ProfileLookupCalls));
     const uint64_t sequence = InterlockedIncrement64(
         reinterpret_cast<volatile LONG64*>(&g_ProfileTraceIndex));
     const size_t slot = static_cast<size_t>(sequence % kProfileTraceCapacity);
@@ -3130,6 +4462,27 @@ void Evt_WeixinLoad()
     // when another code path invokes the copy/serialization helper.
     InstallSendMsgRequestObserverHook();
     InstallSendMsgElementObserverHook();
+    // Read-only contact response parser observation.  This populates the
+    // bounded contact cache from WeChat's own response objects, so /GetContact
+    // does not need to wake or access an idle SQLite connection.
+    InstallContactResponseParserHook();
+    InstallContactStartupVectorHook();
+    InstallContactListBuildHook();
+    InstallContactSessionInfoHook();
+    InstallContactPipelineHook();
+    InstallContactRecordParserHook();
+    InstallContactSyncSourceHook();
+    InstallContactSyncCallbackHook();
+    // ABI was rechecked against sub_1826C6C10: the second argument is the
+    // caller-owned vector pointer, not an integer mode.  The corrected hook
+    // observes the 1080-byte contact-record list without calling WeChat code.
+    InstallContactManagerListHook();
+    InstallContactListSourceHook();
+    InstallContactResponseBatchHook();
+    InstallContactResponseSplitHook();
+    InstallContactGeneralQueryHook();
+    InstallContactDetailHook();
+    InstallContactDetailRecordHook();
     InstallSqliteApiHooks();
     // Message/database hooks remain disabled until the login-time memory
     // regression is isolated.

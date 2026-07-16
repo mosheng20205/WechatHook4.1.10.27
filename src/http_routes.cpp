@@ -18,6 +18,7 @@ void RegisterRoutes(httplib::Server& svr)
     Route_SendTextMsg(svr);
     RegisterGetSelfProfile(svr);
     RegisterGetContact(svr);
+    RegisterGetContacts(svr);
     Route_ForwardXMLMsg(svr);
     Route_SendImageMsg(svr);
     Route_QueryDB(svr);
