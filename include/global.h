@@ -33,6 +33,7 @@ extern volatile uint64_t g_LoginFinishCalls;
 extern volatile uint64_t g_LoginFinishContext;
 extern volatile uint64_t g_LoginFinishPayload;
 extern volatile uint64_t g_ProfileGetterCalls;
+extern volatile uint64_t g_ProfileGetterNullStreak;
 extern volatile uint64_t g_MessageReceiveCalls;
 extern volatile uint64_t g_MessageCallbackPosts;
 extern volatile uint64_t g_MessageHookInstalled;
@@ -127,6 +128,14 @@ extern volatile uint64_t g_SqliteLastDbHandle;
 extern volatile uint64_t g_SqliteLastDbThreadId;
 extern volatile uint64_t g_SqliteContactDbHandle;
 extern volatile uint64_t g_SqliteContactDbThreadId;
+extern char g_SqliteLastDbPath[512];
+extern char g_SqliteContactDbPath[512];
+extern volatile uint64_t g_ContactQueryRequests;
+extern volatile uint64_t g_ContactQueryTryCalls;
+extern volatile uint64_t g_ContactQueryClaims;
+extern volatile uint64_t g_ContactQueryExecuteCalls;
+extern volatile uint64_t g_ContactQueryCompleteCalls;
+extern volatile uint64_t g_ContactQueryLastDb;
 extern char g_SqliteLastSql[4096];
 extern char g_SqliteInterestingSql[4096];
 extern char g_SqliteLastBindText[4096];
@@ -144,6 +153,12 @@ extern SqliteBindTrace g_SqliteBindTraces[kSqliteBindTraceCapacity];
 extern volatile uint64_t g_SqliteBindTraceIndex;
 bool RunContactQueryOnSqliteThread(const std::string& wxid, std::string& resultJson,
                                    uint32_t timeoutMs);
+bool RunSqlQueryOnSqliteThread(const std::string& dbname, const std::string& sql,
+                               std::string& resultJson, uint32_t timeoutMs);
+// Called only from the SQLite hook thread after a Contact row has been read.
+// The HTTP thread consumes this bounded cache; it never dereferences SQLite
+// objects directly.
+void RecordCapturedContactRow(const std::string& wxid, const std::string& rowJson);
 extern volatile uint64_t g_MessageParserCalls;
 extern volatile uint64_t g_MessageParserLastObject;
 extern volatile uint64_t g_SyncContextObject;

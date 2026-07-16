@@ -46,57 +46,25 @@ void Route_QueryDB(httplib::Server& svr)
             }
 
 
-            //初始化数据库管理器
-            //OutputDebugStringA("[QueryDB] 初始化数据库管理器\n");
+            const std::string optDbName = reqJson.value("optDbName", "");
+            const std::string sql = reqJson.value("SQL", "");
             nlohmann::ordered_json result;
-            try
-            {
-                xmgr::DatabaseMgr& g_dbMgr = xmgr::DatabaseMgr::getInstance();
-            //OutputDebugStringA("[QueryDB] 初始化完成\n");
-
-
-            std::string optDbName = reqJson.value("optDbName", "");         // MicroMsg.db
-            std::string sql = reqJson.value("SQL", "");                     // 查询语句   SELECT * FROM ChatRoom LIMIT 10
-
-                result = g_dbMgr.execute(optDbName, sql);
-            }
-            catch (const std::exception& e)
-            {
-                result = { {"status",-500},{"desc",std::string("exception: ") + e.what()},{"debug",std::string(g_DbDebugText)} };
-            }
-            catch (...)
-            {
-                result = { {"status",-501},{"desc","unknown exception"},{"debug",std::string(g_DbDebugText)} };
-            }
-
-
-            // 使用临界区保护数据库访问
-            /*
-            EnterCriticalSection(&g_dbMgrCriticalSection);
-            try {
-                auto start = std::chrono::high_resolution_clock::now();
-                auto result = g_dbMgr.execute(optDbName, sql);
-                auto end = std::chrono::high_resolution_clock::now();
-
-                auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
-                resp["ret"] = result.value("status", 0);
-                resp["msg"] = result.value("desc", "");
-                resp["data"] = result.value("data", json::array());
-                resp["duration_ms"] = duration.count();
-
-                // 慢查询日志
-                if (duration.count() > 1000) {
-                    OutputDebugStringA(format_string("Slow query: %lldms - %s", duration.count(), sql.substr(0, 100)).c_str());
+            std::string resultJson;
+            if (!g_IsLogin) {
+                result = {{"status", -401}, {"desc", "微信未登录"}};
+            } else if (!RunSqlQueryOnSqliteThread(optDbName, sql, resultJson, 15000)) {
+                result = {{"status", -504},
+                          {"desc", "read-only query timed out or was rejected"},
+                          {"debug", std::string(g_DbDebugText)}};
+            } else {
+                try {
+                    result = nlohmann::ordered_json::parse(resultJson);
+                } catch (...) {
+                    result = {{"status", -505},
+                              {"desc", "invalid query response"},
+                              {"debug", std::string(g_DbDebugText)}};
                 }
-
             }
-            catch (const std::exception& e) {
-                resp["ret"] = -500;
-                resp["msg"] = std::string("Database error: ") + e.what();
-            }
-            LeaveCriticalSection(&g_dbMgrCriticalSection);
-            */
 
 
             res.set_content(result.dump(4, ' ', false), "application/json; charset=utf-8");
@@ -122,26 +90,20 @@ void Route_QueryDB(httplib::Server& svr)
             }
 
 
-            //初始化数据库管理器
-            //OutputDebugStringA("[QueryDB] 初始化数据库管理器\n");
-            nlohmann::ordered_json dbInfo;
-            try
-            {
-                xmgr::DatabaseMgr& g_dbMgr = xmgr::DatabaseMgr::getInstance();
-            //OutputDebugStringA("[QueryDB] 初始化完成\n");
-
-            // 方式2：获取所有数据库信息
-                dbInfo = g_dbMgr.getDatabaseInfo();
+            // Only report handles captured from WeChat's own SQLite thread.
+            // Do not scan memory or dereference the handle on the HTTP thread.
+            nlohmann::ordered_json dbInfo = nlohmann::ordered_json::array();
+            if (g_IsLogin && g_SqliteContactDbHandle != 0) {
+                const std::string dbPath = g_SqliteContactDbPath;
+                const bool modernContact = dbPath.find("contact.db") != std::string::npos &&
+                    dbPath.find("contact_fts.db") == std::string::npos;
+                dbInfo.push_back({
+                    {"dbName", modernContact ? "contact.db" : "MicroMsg.db"},
+                    {"dbHandle", g_SqliteContactDbHandle},
+                    {"dbPath", dbPath},
+                    {"source", "sqlite-hook"}
+                });
             }
-            catch (const std::exception& e)
-            {
-                dbInfo = { {"status",-500},{"desc",std::string("exception: ") + e.what()},{"debug",std::string(g_DbDebugText)} };
-            }
-            catch (...)
-            {
-                dbInfo = { {"status",-501},{"desc","unknown exception"},{"debug",std::string(g_DbDebugText)} };
-            }
-            // 返回：{"dbName":"MicroMsg.db","dbHandle":140736870540544}
 
             res.set_content(dbInfo.dump(4, ' ', false), "application/json; charset=utf-8");
 
@@ -162,6 +124,7 @@ void Route_QueryDB(httplib::Server& svr)
         resp["LoginFinishCalls"] = g_LoginFinishCalls;
         resp["LoginFinishContext"] = g_LoginFinishContext;
         resp["LoginFinishPayload"] = g_LoginFinishPayload;
+        resp["ProfileGetterNullStreak"] = g_ProfileGetterNullStreak;
         resp["MessageReceiveCalls"] = g_MessageReceiveCalls;
         resp["MessageCallbackPosts"] = g_MessageCallbackPosts;
         resp["MessageHookInstalled"] = g_MessageHookInstalled;
@@ -254,6 +217,14 @@ void Route_QueryDB(httplib::Server& svr)
         resp["SqliteLastDbThreadId"] = g_SqliteLastDbThreadId;
         resp["SqliteContactDbHandle"] = g_SqliteContactDbHandle;
         resp["SqliteContactDbThreadId"] = g_SqliteContactDbThreadId;
+        resp["SqliteLastDbPath"] = std::string(g_SqliteLastDbPath);
+        resp["SqliteContactDbPath"] = std::string(g_SqliteContactDbPath);
+        resp["ContactQueryRequests"] = g_ContactQueryRequests;
+        resp["ContactQueryTryCalls"] = g_ContactQueryTryCalls;
+        resp["ContactQueryClaims"] = g_ContactQueryClaims;
+        resp["ContactQueryExecuteCalls"] = g_ContactQueryExecuteCalls;
+        resp["ContactQueryCompleteCalls"] = g_ContactQueryCompleteCalls;
+        resp["ContactQueryLastDb"] = g_ContactQueryLastDb;
         resp["SqliteLastSql"] = std::string(g_SqliteLastSql);
         resp["SqliteInterestingSql"] = std::string(g_SqliteInterestingSql);
         resp["SqliteLastBindText"] = std::string(g_SqliteLastBindText);

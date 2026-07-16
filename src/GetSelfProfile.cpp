@@ -3,6 +3,9 @@
 #include <windows.h>
 #include <string>
 #include <cstring>
+#include <initializer_list>
+#include <mutex>
+#include <unordered_map>
 #include "global.h"
 #include "tools.h"
 #include "db_mgr.h"
@@ -13,6 +16,9 @@
 using json = nlohmann::json;
 
 namespace {
+
+std::mutex g_ProfileContactCacheMutex;
+std::unordered_map<std::string, json> g_ProfileContactCache;
 
 bool ReadProfileInlineString(uintptr_t base, size_t offset, std::string& value)
 {
@@ -35,6 +41,7 @@ bool ReadProfileInlineString(uintptr_t base, size_t offset, std::string& value)
 
 struct RuntimeProfile {
     std::string accountId;
+    std::string alias;
     std::string nickname;
     std::string phone;
     uint64_t object = 0;
@@ -46,12 +53,123 @@ struct RuntimeProfile {
     bool valid = false;
 };
 
+std::string ReadContactString(const json& row,
+                              std::initializer_list<const char*> names)
+{
+    for (const char* name : names) {
+        if (!name || !row.contains(name) || row[name].is_null())
+            continue;
+        if (row[name].is_string())
+            return row[name].get<std::string>();
+        if (row[name].is_number_integer())
+            return std::to_string(row[name].get<long long>());
+    }
+    return {};
+}
+
+int ReadContactInteger(const json& row,
+                       std::initializer_list<const char*> names)
+{
+    for (const char* name : names) {
+        if (!name || !row.contains(name) || row[name].is_null())
+            continue;
+        try {
+            if (row[name].is_number_integer())
+                return row[name].get<int>();
+            if (row[name].is_string() && !row[name].get<std::string>().empty())
+                return std::stoi(row[name].get<std::string>());
+        } catch (...) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+void CacheContactRow(const std::string& wxid, const json& row)
+{
+    if (wxid.empty() || !row.is_object())
+        return;
+    std::lock_guard<std::mutex> lock(g_ProfileContactCacheMutex);
+    // Keep this cache bounded and only retain the most recent 128 contacts.
+    if (g_ProfileContactCache.size() >= 128 &&
+        g_ProfileContactCache.find(wxid) == g_ProfileContactCache.end()) {
+        g_ProfileContactCache.erase(g_ProfileContactCache.begin());
+    }
+    g_ProfileContactCache[wxid] = row;
+}
+
+bool GetCachedContactRow(const std::string& wxid, json& row)
+{
+    std::lock_guard<std::mutex> lock(g_ProfileContactCacheMutex);
+    const auto it = g_ProfileContactCache.find(wxid);
+    if (it == g_ProfileContactCache.end())
+        return false;
+    row = it->second;
+    return true;
+}
+
+void ClearContactCache()
+{
+    std::lock_guard<std::mutex> lock(g_ProfileContactCacheMutex);
+    g_ProfileContactCache.clear();
+}
+
+void ApplyContactRow(RuntimeProfile& profile, const json& row)
+{
+    if (!row.is_object())
+        return;
+    profile.alias = ReadContactString(row, {"Alias", "alias"});
+    profile.area = ReadContactString(row, {"Province", "province"});
+    const std::string city = ReadContactString(row, {"City", "city"});
+    if (!city.empty()) {
+        if (!profile.area.empty())
+            profile.area += " ";
+        profile.area += city;
+    }
+    profile.signature = ReadContactString(row, {"Signature", "signature"});
+    profile.avatar = ReadContactString(row, {"BigHeadImgUrl", "big_head_url"});
+    profile.smallAvatar = ReadContactString(
+        row, {"SmallHeadImgUrl", "small_head_url"});
+    profile.sex = ReadContactInteger(row, {"Sex", "sex"});
+}
+
 void ReadDatabaseProfile(RuntimeProfile& profile)
 {
-    // The Contact database is owned by a WeChat worker thread.  Do not issue
-    // a cross-thread SQLite query from the HTTP handler; leave optional
-    // fields empty until a thread-safe profile callback is available.
-    (void)profile;
+    if (profile.accountId.empty() || !g_IsLogin)
+        return;
+
+    // A successful /GetContact request populates this cache.  Reusing it here
+    // avoids a second SQLite round trip while WeChat is idle.
+    json cachedRow;
+    if (GetCachedContactRow(profile.accountId, cachedRow)) {
+        ApplyContactRow(profile, cachedRow);
+        return;
+    }
+
+    // The Contact database is owned by a WeChat worker thread.  The helper
+    // queues this read and executes it from the SQLite hook on that thread;
+    // the HTTP worker never calls sqlite3_prepare/step on the internal handle.
+    std::string resultJson;
+    // Optional fields must not make the profile endpoint block for the full
+    // contact-query timeout when WeChat is idle and no SQLite callback is
+    // currently running.  The required runtime fields are already available.
+    if (!RunContactQueryOnSqliteThread(profile.accountId, resultJson, 1000))
+        return;
+
+    try {
+        const json result = json::parse(resultJson);
+        if (result.value("status", -1) != 0 ||
+            !result.contains("data") || !result["data"].is_array() ||
+            result["data"].empty() || !result["data"][0].is_object()) {
+            return;
+        }
+
+        const json& row = result["data"][0];
+        CacheContactRow(profile.accountId, row);
+        ApplyContactRow(profile, row);
+    } catch (...) {
+        // Optional fields must never make the required runtime fields fail.
+    }
 }
 
 RuntimeProfile ReadRuntimeProfile()
@@ -75,6 +193,18 @@ RuntimeProfile ReadRuntimeProfile()
 
 }
 
+void RecordCapturedContactRow(const std::string& wxid, const std::string& rowJson)
+{
+    if (wxid.empty() || rowJson.empty())
+        return;
+    try {
+        const json row = json::parse(rowJson);
+        CacheContactRow(wxid, row);
+    } catch (...) {
+        // A malformed row must never affect the SQLite hook thread.
+    }
+}
+
 
 /* =========================
    核心：获取个人资料
@@ -96,6 +226,7 @@ void RegisterGetSelfProfile(httplib::Server& svr)
         const bool loggedIn = g_IsLogin != 0;
         if (!loggedIn) {
             // Do not return data cached from a previous account/session.
+            ClearContactCache();
             resp["wxid"] = "";
             resp["alias"] = "";
             resp["nickname"] = "";
@@ -120,7 +251,7 @@ void RegisterGetSelfProfile(httplib::Server& svr)
             ReadDatabaseProfile(runtime);
             // The first field is the verified account identifier candidate.
             SelfInfo.wxid = runtime.accountId;
-            SelfInfo.alias = runtime.accountId;
+            SelfInfo.alias = runtime.alias.empty() ? runtime.accountId : runtime.alias;
             SelfInfo.nickname = runtime.nickname;
             SelfInfo.phone = runtime.phone;
             SelfInfo.area = runtime.area;
@@ -184,6 +315,19 @@ void RegisterGetContact(httplib::Server& svr)
                 return;
             }
 
+            // Serve a row captured by the SQLite hook without touching the
+            // internal connection again. This keeps the endpoint usable while
+            // WeChat is idle after a contact was recently displayed.
+            json cachedRow;
+            if (GetCachedContactRow(wxid, cachedRow)) {
+                resp = cachedRow;
+                resp["status"] = 0;
+                resp["contact_found"] = true;
+                resp["wxid"] = wxid;
+                res.set_content(resp.dump(4, ' ', false), "application/json; charset=utf-8");
+                return;
+            }
+
             // Queue the query to the thread that is currently using the
             // captured SQLite connection.  The HTTP worker never touches the
             // connection directly.
@@ -228,6 +372,7 @@ void RegisterGetContact(httplib::Server& svr)
                 resp["ImgBuf"] = "";
                 resp["ImgBufTruncated"] = true;
             }
+            CacheContactRow(wxid, resp);
             res.set_content(resp.dump(4, ' ', false), "application/json; charset=utf-8");
         });
 }

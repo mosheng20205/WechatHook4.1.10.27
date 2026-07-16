@@ -360,6 +360,8 @@ namespace WeixinSend
 
         // 分配第一个结构: 0x20 (32字节)
         InnerStruct1* struct1 = (InnerStruct1*)HeapAlloc(GetProcessHeap(), 8, 0x20);
+        if (!struct1)
+            return nullptr;
 
         // 初始化第一个结构
         struct1->ptr1 = (void*)(msgStruct + 0x10);  // 指向消息结构的 +0x10 偏移
@@ -369,6 +371,10 @@ namespace WeixinSend
 
         // 分配第二个结构: 0x28 (40字节)
         InnerStruct2* struct2 = (InnerStruct2*)HeapAlloc(GetProcessHeap(), 8, 0x28);
+        if (!struct2) {
+            HeapFree(GetProcessHeap(), 0, struct1);
+            return nullptr;
+        }
 
         // 初始化第二个结构
         struct2->vtable = (void*)(hModule + offset::param1_vtable);  // vtable 指针
@@ -381,27 +387,38 @@ namespace WeixinSend
         return struct2;
     }
 
-    void SendImage(const std::string& wxid, const std::string& imgPath)
+    bool SendImage(const std::string& wxid, const std::string& imgPath)
     {
+        if (wxid.empty() || imgPath.empty() || !GetModuleHandleA("Weixin.dll"))
+            return false;
+        const uint64_t filesize = 文件_取大小(imgPath);
+        if (filesize == 0)
+            return false;
         uintptr_t WeixinDLL_baseAddr = GetWeixinDllBase();
 
         uint64_t* msgStruct = (uint64_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 0x7C0);
         if (!msgStruct) {
-            return;
+            return false;
         }
 
         BuildSendParam1_sub(msgStruct, wxid, imgPath);
 
         uint64_t* struct2 = (uint64_t*)BuildSendParam1((uint64_t)msgStruct);
+        if (!struct2)
+            return false;
 
 
         uint64_t* paramStruct = (uint64_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 0xE8);
+        if (!paramStruct)
+            return false;
 
         BuildSendParam2_Image(paramStruct);
 
         WeixinCall send_message = (WeixinCall)(WeixinDLL_baseAddr + offset::send_message);
+        if (!send_message)
+            return false;
         send_message((uint64_t)struct2, (uint64_t)paramStruct);
-
+        return true;
     }
 
 
@@ -506,19 +523,29 @@ namespace WeixinSend
 
 
 
-    void DecodePic(const std::string& enc_pic_path, const std::string& dec_pic_path)
+    bool DecodePic(const std::string& enc_pic_path, const std::string& dec_pic_path)
     {
         uintptr_t base = GetWeixinDllBase();
+        if (!base || enc_pic_path.empty() || dec_pic_path.empty() ||
+            enc_pic_path.size() > 32768 || dec_pic_path.size() > 32768)
+            return false;
 
         uint64_t* arg1 = HeapAlloc_mb<uint64_t>(0x28);
+        if (!arg1)
+            return false;
         SetWeixinString((WeixinString*)(arg1), enc_pic_path);
 
         uint64_t* arg2 = HeapAlloc_mb<uint64_t>(0x28);
+        if (!arg2) {
+            HeapFree(GetProcessHeap(), 0, arg1);
+            return false;
+        }
         SetWeixinString((WeixinString*)(arg2), dec_pic_path);
 
 
         WeixinCall Decode_Pic = (WeixinCall)(base + offset::dec_pic_call);
         Decode_Pic((uint64_t)arg1, (uint64_t)arg2, 1);
+        return true;
     }
 
 }

@@ -5,12 +5,14 @@
 #include <Windows.h>
 #include <winternl.h>
 #include <cstring>
+#include <cctype>
 #include <sstream>
 #include <condition_variable>
 #include <chrono>
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 
 #include "http_server.h"
 #include "Hook_Method.h"
@@ -503,6 +505,9 @@ static void RecordSqliteBindTrace16(const char* apiName, sqlite3_stmt* stmt, int
     CaptureSqlText16(text16, len, item.text, g_SqliteInterestingBindText);
 }
 
+static void CaptureSqliteDbPath(sqlite3* db, char* dst, size_t cap);
+static int IdentifyMicroMsgDatabase(sqlite3* db);
+
 static void CaptureSqliteDbHandle(sqlite3* db)
 {
     if (!db)
@@ -513,6 +518,24 @@ static void CaptureSqliteDbHandle(sqlite3* db)
                                   reinterpret_cast<LONG64>(db));
         InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SqliteLastDbThreadId),
                               static_cast<LONG64>(GetCurrentThreadId()));
+        CaptureSqliteDbPath(db, g_SqliteLastDbPath, sizeof(g_SqliteLastDbPath));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+static void CaptureSqliteDbPath(sqlite3* db, char* dst, size_t cap)
+{
+    if (!db || !dst || cap == 0 || !g_hWeixinDll)
+        return;
+    __try {
+        auto* api = reinterpret_cast<sqlite3_api_routines*>(
+            reinterpret_cast<uintptr_t>(g_hWeixinDll) + XWECHAT_SQLITE3_API_ROUTINES_OFFSET);
+        if (!IsReadablePointer(api) ||
+            !IsExecutablePointer(reinterpret_cast<void*>(api->db_filename)))
+            return;
+        const char* filename = api->db_filename(db, "main");
+        if (filename && IsReadablePointer(filename))
+            CopySafeText(filename, dst, cap);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 }
@@ -523,15 +546,79 @@ static void CaptureContactDbHandle(sqlite3* db, const char* sql, int nByte)
         return;
     char text[2048]{};
     CopySafeTextN(sql, nByte, text, sizeof(text));
-    if (!strstr(text, "Contact") && !strstr(text, "contact") &&
-        !strstr(text, "ChatRoom") && !strstr(text, "chatroom"))
+    auto hasTableReference = [](const char* value, const char* table) {
+        if (!value || !table)
+            return false;
+        std::string lower(value);
+        for (char& c : lower)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        const std::string name(table);
+        for (const char* verb : {"from ", "join ", "update ", "into "}) {
+            const std::string needle = std::string(verb) + name;
+            size_t pos = lower.find(needle);
+            while (pos != std::string::npos) {
+                const size_t end = pos + needle.size();
+                if (end == lower.size() ||
+                    !(std::isalnum(static_cast<unsigned char>(lower[end])) ||
+                      lower[end] == '_'))
+                    return true;
+                pos = lower.find(needle, pos + 1);
+            }
+        }
+        return false;
+    };
+    // Match the actual Contact/ChatRoom tables, not ContactFTS or other
+    // auxiliary databases whose SQL merely contains the word "Contact".
+    if (!hasTableReference(text, "contact") && !hasTableReference(text, "chatroom"))
         return;
     if (!IsReadablePointer(db))
+        return;
+    // Queries against contact_fts.db also contain the word "Contact", but
+    // that database does not contain the Contact table used by this route.
+    // An exact Contact/ChatRoom table reference is a stronger signal than the
+    // filename API, which is empty for this encrypted build.  Reject only a
+    // connection that SQLite positively identifies as another named database.
+    if (IdentifyMicroMsgDatabase(db) == 0)
         return;
     InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SqliteContactDbHandle),
                           reinterpret_cast<LONG64>(db));
     InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SqliteContactDbThreadId),
                           static_cast<LONG64>(GetCurrentThreadId()));
+    CaptureSqliteDbPath(db, g_SqliteContactDbPath, sizeof(g_SqliteContactDbPath));
+}
+
+// Identify the connection by SQLite's own filename API instead of assuming
+// that the most recently observed connection is MicroMsg.db.  WeChat 4.1.10.27
+// uses db_storage\contact\contact.db for contacts, while older builds used
+// MicroMsg.db.  Return 1 for either supported contact database, 0 for another
+// named database, and -1 when the API/filename is unavailable.
+static int IdentifyMicroMsgDatabase(sqlite3* db)
+{
+    if (!db || !g_hWeixinDll)
+        return -1;
+    char filenameCopy[1024]{};
+    __try {
+        auto* api = reinterpret_cast<sqlite3_api_routines*>(
+            reinterpret_cast<uintptr_t>(g_hWeixinDll) + XWECHAT_SQLITE3_API_ROUTINES_OFFSET);
+        if (!IsReadablePointer(api) || !IsExecutablePointer(reinterpret_cast<void*>(api->db_filename)))
+            return -1;
+        const char* filename = api->db_filename(db, "main");
+        if (!filename || !IsReadablePointer(filename))
+            return -1;
+        strncpy_s(filenameCopy, sizeof(filenameCopy), filename, _TRUNCATE);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+    if (!filenameCopy[0])
+        return -1;
+    for (char* p = filenameCopy; *p; ++p)
+        *p = static_cast<char>(std::tolower(static_cast<unsigned char>(*p)));
+    const bool oldContactDb = strstr(filenameCopy, "micromsg.db") != nullptr;
+    const bool modernContactDb = strstr(filenameCopy, "\\contact\\contact.db") != nullptr ||
+        strstr(filenameCopy, "/contact/contact.db") != nullptr ||
+        (strlen(filenameCopy) >= 10 &&
+         _stricmp(filenameCopy + strlen(filenameCopy) - 10, "contact.db") == 0);
+    return oldContactDb || modernContactDb ? 1 : 0;
 }
 
 namespace {
@@ -542,8 +629,13 @@ bool g_ContactQueryActive = false;
 bool g_ContactQueryDone = false;
 bool g_ContactQueryClaimed = false;
 std::string g_ContactQueryWxid;
+std::string g_ContactQueryDbName;
+std::string g_ContactQuerySql;
+bool g_ContactQueryGeneric = false;
 std::string g_ContactQueryResult;
 thread_local bool g_ContactQueryInProgress = false;
+std::mutex g_SqliteStmtSqlMutex;
+std::unordered_map<sqlite3_stmt*, std::string> g_SqliteStmtSql;
 
 static std::string QuoteSqlText(const std::string& value)
 {
@@ -560,22 +652,62 @@ static std::string QuoteSqlText(const std::string& value)
 
 static void TryProcessPendingContactQuery(sqlite3* db)
 {
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactQueryTryCalls));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ContactQueryLastDb),
+                          reinterpret_cast<LONG64>(db));
     if (!db || g_ContactQueryInProgress)
         return;
     std::string wxid;
+    std::string sql;
     {
         std::lock_guard<std::mutex> lock(g_ContactQueryMutex);
         if (!g_ContactQueryActive || g_ContactQueryClaimed)
             return;
+        if (g_SqliteContactDbHandle != 0 &&
+            reinterpret_cast<uint64_t>(db) != g_SqliteContactDbHandle &&
+            IdentifyMicroMsgDatabase(db) == 0) {
+            // WeChat may keep a pool of connections for the same
+            // contact\contact.db.  Accept every positively identified
+            // contact connection, but continue rejecting auxiliary DBs.
+            return;
+        }
+        if (g_ContactQueryGeneric) {
+            const int databaseKind = IdentifyMicroMsgDatabase(db);
+            if (databaseKind == 0)
+                return;
+            if (databaseKind < 0 && g_SqliteContactDbHandle != 0 &&
+                reinterpret_cast<uint64_t>(db) != g_SqliteContactDbHandle)
+                return;
+        }
         g_ContactQueryClaimed = true;
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactQueryClaims));
         wxid = g_ContactQueryWxid;
+        sql = g_ContactQueryGeneric
+            ? g_ContactQuerySql
+            : "SELECT * FROM Contact WHERE UserName=" + QuoteSqlText(wxid) + " LIMIT 1";
     }
 
     g_ContactQueryInProgress = true;
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactQueryExecuteCalls));
     nlohmann::ordered_json result;
     try {
-        const std::string sql = "SELECT * FROM Contact WHERE UserName=" +
-            QuoteSqlText(wxid) + " LIMIT 1";
+        if (!g_ContactQueryGeneric) {
+            // Verify the schema before issuing SELECT * FROM Contact.  This
+            // keeps wrong encrypted/FTS handles from producing noisy errors
+            // and lets the hook continue looking for the real MicroMsg.db
+            // connection on the next SQLite callback.
+            const auto schema = xmgr::DatabaseMgr::getInstance().execute(
+                db, "SELECT name FROM sqlite_master WHERE type='table' AND name='Contact' LIMIT 1");
+            const bool hasContact = schema.is_object() &&
+                schema.value("status", -1) == 0 &&
+                schema.contains("data") && schema["data"].is_array() &&
+                !schema["data"].empty();
+            if (!hasContact) {
+                std::lock_guard<std::mutex> lock(g_ContactQueryMutex);
+                g_ContactQueryClaimed = false;
+                return;
+            }
+        }
         result = xmgr::DatabaseMgr::getInstance().execute(db, sql);
     } catch (const std::exception& e) {
         result = { {"status", -500}, {"desc", e.what()} };
@@ -586,13 +718,124 @@ static void TryProcessPendingContactQuery(sqlite3* db)
 
     {
         std::lock_guard<std::mutex> lock(g_ContactQueryMutex);
-        if (g_ContactQueryActive) {
+        const int resultStatus = result.is_object() ? result.value("status", -1) : -1;
+        if (g_ContactQueryActive && resultStatus == 0) {
             g_ContactQueryResult = result.dump();
             g_ContactQueryDone = true;
+            InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactQueryCompleteCalls));
+        } else if (g_ContactQueryActive) {
+            // Keep the concrete SQLite error visible to /QueryDB/status.  A
+            // non-zero result is deliberately retried on a later SQLite hook
+            // call, but a timeout without this detail is indistinguishable
+            // from a connection/handle mismatch.
+            const std::string diagnostic = result.dump();
+            sprintf_s(g_DbDebugText, sizeof(g_DbDebugText),
+                      "contact query result: %s", diagnostic.c_str());
         }
         g_ContactQueryClaimed = false;
     }
     g_ContactQueryCv.notify_all();
+}
+
+static bool IsReadOnlySql(const std::string& sql)
+{
+    if (sql.empty() || sql.size() > 8192 || sql.find(';') != std::string::npos)
+        return false;
+
+    std::string normalized;
+    normalized.reserve(sql.size());
+    for (const unsigned char c : sql) {
+        normalized.push_back(static_cast<char>(std::tolower(c)));
+    }
+    size_t first = normalized.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+        return false;
+    const bool startsRead = normalized.compare(first, 6, "select") == 0 ||
+        normalized.compare(first, 4, "with") == 0 ||
+        normalized.compare(first, 6, "pragma") == 0;
+    if (!startsRead)
+        return false;
+
+    static constexpr const char* kBlocked[] = {
+        "insert", "update", "delete", "replace", "attach", "detach",
+        "create", "drop", "alter", "vacuum", "reindex", "begin",
+        "commit", "rollback"
+    };
+    for (const char* word : kBlocked) {
+        if (normalized.find(word) != std::string::npos)
+            return false;
+    }
+    return true;
+}
+
+static void RememberSqliteStatement(sqlite3_stmt* stmt, const char* sql, int nByte)
+{
+    if (!stmt || !sql)
+        return;
+    char text[8192]{};
+    CopySafeTextN(sql, nByte, text, sizeof(text));
+    std::lock_guard<std::mutex> lock(g_SqliteStmtSqlMutex);
+    if (g_SqliteStmtSql.size() >= 256 && g_SqliteStmtSql.find(stmt) == g_SqliteStmtSql.end())
+        g_SqliteStmtSql.erase(g_SqliteStmtSql.begin());
+    g_SqliteStmtSql[stmt] = text;
+}
+
+static std::string LookupSqliteStatement(sqlite3_stmt* stmt)
+{
+    std::lock_guard<std::mutex> lock(g_SqliteStmtSqlMutex);
+    const auto it = g_SqliteStmtSql.find(stmt);
+    return it == g_SqliteStmtSql.end() ? std::string{} : it->second;
+}
+
+static void ForgetSqliteStatement(sqlite3_stmt* stmt)
+{
+    if (!stmt)
+        return;
+    std::lock_guard<std::mutex> lock(g_SqliteStmtSqlMutex);
+    g_SqliteStmtSql.erase(stmt);
+}
+
+static void CaptureContactRowFromStatement(sqlite3_stmt* stmt, const std::string& sql)
+{
+    if (!stmt || sql.empty() ||
+        (sql.find("Contact") == std::string::npos &&
+         sql.find("contact") == std::string::npos))
+        return;
+    auto* api = reinterpret_cast<sqlite3_api_routines*>(
+            reinterpret_cast<uintptr_t>(g_hWeixinDll) + XWECHAT_SQLITE3_API_ROUTINES_OFFSET);
+    if (!api || !IsReadablePointer(api) ||
+        !IsExecutablePointer(reinterpret_cast<void*>(api->column_count)) ||
+        !IsExecutablePointer(reinterpret_cast<void*>(api->column_name)) ||
+        !IsExecutablePointer(reinterpret_cast<void*>(api->column_type)) ||
+        !IsExecutablePointer(reinterpret_cast<void*>(api->column_blob)) ||
+        !IsExecutablePointer(reinterpret_cast<void*>(api->column_bytes)))
+        return;
+    const int count = api->column_count(stmt);
+    if (count <= 0 || count > 256)
+        return;
+    nlohmann::ordered_json row = nlohmann::ordered_json::object();
+    std::string wxid;
+    for (int i = 0; i < count; ++i) {
+        const char* name = api->column_name(stmt, i);
+        if (!name || !*name)
+            continue;
+        const void* value = api->column_blob(stmt, i);
+        const int length = api->column_bytes(stmt, i);
+        if (length < 0 || length > 1024 * 1024)
+            continue;
+        std::string text;
+        if (value && length > 0)
+            text.assign(static_cast<const char*>(value), static_cast<size_t>(length));
+        row[name] = text;
+        std::string lower(name);
+        for (char& c : lower)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if ((lower == "username" || lower == "user_name" || lower == "wxid") &&
+            !text.empty())
+            wxid = text;
+    }
+    if (!wxid.empty())
+        RecordCapturedContactRow(wxid, row.dump());
 }
 
 } // namespace
@@ -607,9 +850,13 @@ bool RunContactQueryOnSqliteThread(const std::string& wxid, std::string& resultJ
     if (g_ContactQueryActive)
         return false;
     g_ContactQueryActive = true;
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ContactQueryRequests));
     g_ContactQueryDone = false;
     g_ContactQueryClaimed = false;
+    g_ContactQueryGeneric = false;
     g_ContactQueryWxid = wxid;
+    g_ContactQueryDbName = "MicroMsg.db";
+    g_ContactQuerySql.clear();
     g_ContactQueryResult.clear();
     if (!g_ContactQueryCv.wait_for(lock, std::chrono::milliseconds(timeoutMs),
                                    [] { return g_ContactQueryDone; })) {
@@ -620,6 +867,49 @@ bool RunContactQueryOnSqliteThread(const std::string& wxid, std::string& resultJ
     resultJson = g_ContactQueryResult;
     g_ContactQueryActive = false;
     g_ContactQueryWxid.clear();
+    g_ContactQueryDbName.clear();
+    return !resultJson.empty();
+}
+
+bool RunSqlQueryOnSqliteThread(const std::string& dbname, const std::string& sql,
+                               std::string& resultJson, uint32_t timeoutMs)
+{
+    resultJson.clear();
+    if (dbname != "MicroMsg.db" && dbname != "contact.db") {
+        resultJson = R"({"status":-400,"desc":"only MicroMsg.db or contact.db is supported"})";
+        return true;
+    }
+    if (!IsReadOnlySql(sql)) {
+        resultJson = R"({"status":-400,"desc":"only single read-only SELECT/WITH/PRAGMA statements are allowed"})";
+        return true;
+    }
+    if (timeoutMs == 0)
+        return false;
+
+    std::unique_lock<std::mutex> lock(g_ContactQueryMutex);
+    if (g_ContactQueryActive)
+        return false;
+    g_ContactQueryActive = true;
+    g_ContactQueryDone = false;
+    g_ContactQueryClaimed = false;
+    g_ContactQueryGeneric = true;
+    g_ContactQueryWxid.clear();
+    g_ContactQueryDbName = dbname;
+    g_ContactQuerySql = sql;
+    g_ContactQueryResult.clear();
+    if (!g_ContactQueryCv.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                                   [] { return g_ContactQueryDone; })) {
+        g_ContactQueryActive = false;
+        g_ContactQueryGeneric = false;
+        g_ContactQueryDbName.clear();
+        g_ContactQuerySql.clear();
+        return false;
+    }
+    resultJson = g_ContactQueryResult;
+    g_ContactQueryActive = false;
+    g_ContactQueryGeneric = false;
+    g_ContactQueryDbName.clear();
+    g_ContactQuerySql.clear();
     return !resultJson.empty();
 }
 
@@ -2219,10 +2509,13 @@ static int Hook_SqlitePrepare(sqlite3* db, const char* sql, int nByte,
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SqlitePrepareCalls));
     CaptureSqliteDbHandle(db);
     CaptureSqlText(sql, nByte, g_SqliteLastSql, g_SqliteInterestingSql);
-    CaptureContactDbHandle(db, sql, nByte);
+    if (!g_ContactQueryInProgress)
+        CaptureContactDbHandle(db, sql, nByte);
     const int rc = g_OriginalSqlitePrepare
         ? g_OriginalSqlitePrepare(db, sql, nByte, stmt, tail)
         : SQLITE_ERROR;
+    if (rc == SQLITE_OK && stmt)
+        RememberSqliteStatement(stmt, sql, nByte);
     TryProcessPendingContactQuery(db);
     return rc;
 }
@@ -2233,10 +2526,13 @@ static int Hook_SqlitePrepareV2(sqlite3* db, const char* sql, int nByte,
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SqlitePrepareV2Calls));
     CaptureSqliteDbHandle(db);
     CaptureSqlText(sql, nByte, g_SqliteLastSql, g_SqliteInterestingSql);
-    CaptureContactDbHandle(db, sql, nByte);
+    if (!g_ContactQueryInProgress)
+        CaptureContactDbHandle(db, sql, nByte);
     const int rc = g_OriginalSqlitePrepareV2
         ? g_OriginalSqlitePrepareV2(db, sql, nByte, stmt, tail)
         : SQLITE_ERROR;
+    if (rc == SQLITE_OK && stmt)
+        RememberSqliteStatement(stmt, sql, nByte);
     TryProcessPendingContactQuery(db);
     return rc;
 }
@@ -2270,6 +2566,11 @@ static int Hook_SqliteStep(sqlite3_stmt* stmt)
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SqliteStepCalls));
     CaptureSqliteDbHandleFromStmt(stmt);
     const int rc = g_OriginalSqliteStep ? g_OriginalSqliteStep(stmt) : SQLITE_ERROR;
+    const std::string sql = LookupSqliteStatement(stmt);
+    if (rc == SQLITE_ROW)
+        CaptureContactRowFromStatement(stmt, sql);
+    else if (rc == SQLITE_DONE || rc == SQLITE_ERROR || rc == SQLITE_MISUSE)
+        ForgetSqliteStatement(stmt);
     if (g_SqliteLastDbHandle)
         TryProcessPendingContactQuery(reinterpret_cast<sqlite3*>(
             static_cast<uintptr_t>(g_SqliteLastDbHandle)));
@@ -2611,8 +2912,20 @@ static void __fastcall Hook_ProfileGetter(void* manager, void** out_object)
     if (g_OriginalProfileGetter)
         g_OriginalProfileGetter(manager, out_object);
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ProfileGetterCalls));
-    if (out_object && *out_object)
+    if (out_object && *out_object) {
         g_ProfileObject = reinterpret_cast<uint64_t>(*out_object);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ProfileGetterNullStreak), 0);
+        if (!g_IsLogin)
+            SetMirroredLoginState(1);
+    } else {
+        const uint64_t nullStreak = InterlockedIncrement64(
+            reinterpret_cast<volatile LONG64*>(&g_ProfileGetterNullStreak));
+        // A single null result can be a transient manager refresh. Require a
+        // consecutive run before mirroring logout and clearing the session
+        // object.
+        if (g_IsLogin && nullStreak >= 8)
+            SetMirroredLoginState(0);
+    }
 }
 
 using FnManagerContainerGetter = void(__fastcall*)(void* manager, void** out_object);

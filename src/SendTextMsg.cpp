@@ -1,6 +1,7 @@
 #include "httplib.h"
 #include "json.hpp"
 #include <windows.h>
+#include <filesystem>
 #include "global.h"
 #include "wx_send.h"
 #include "SendTextMsg.h"
@@ -73,17 +74,43 @@ void Route_SendTextMsg(httplib::Server& svr)
             std::string src_path = reqJson.value("src_path", "");
             std::string dst_path = reqJson.value("dst_path", "");
 
+            res.set_header("Content-Type", "application/json; charset=utf-8");
+            if (src_path.empty() || dst_path.empty() || src_path.size() > 32768 ||
+                dst_path.size() > 32768 || src_path.find('\0') != std::string::npos ||
+                dst_path.find('\0') != std::string::npos) {
+                resp["ret"] = -1;
+                resp["msg"] = "src_path and dst_path are required";
+                res.set_content(resp.dump(), "application/json; charset=utf-8");
+                return;
+            }
+            std::error_code fileError;
+            if (!std::filesystem::is_regular_file(src_path, fileError) || fileError ||
+                std::filesystem::file_size(src_path, fileError) == 0 || fileError) {
+                resp["ret"] = -1;
+                resp["msg"] = "src_path is not a readable regular file";
+                res.set_content(resp.dump(), "application/json; charset=utf-8");
+                return;
+            }
+
+            // The decoder RVA is not yet validated against this build.  Keep
+            // the route safe until the call signature and output semantics
+            // are confirmed in IDA and a live WeChat process.
+            resp["ret"] = -3;
+            resp["retmsg"] = "Decode_Pic offset is not runtime-verified for WeChat 4.1.10.27";
+            res.set_content(resp.dump(), "application/json; charset=utf-8");
+            return;
+
             OutputDebugStringA(("Decode_Pic src_path: " + src_path + "\n").c_str());
             OutputDebugStringA(("Decode_Pic dst_path: " + dst_path + "\n").c_str());
 
 
-            WeixinSend::DecodePic(src_path, dst_path);
+            const bool ok = WeixinSend::DecodePic(src_path, dst_path);
 
 
-            resp["ret"] = 0;
-            resp["retmsg"] = "success";
+            resp["ret"] = ok ? 0 : -3;
+            resp["retmsg"] = ok ? "queued" : "decode failed";
 
-            res.set_content(resp.dump(), "application/json");
+            res.set_content(resp.dump(), "application/json; charset=utf-8");
         });
 
 }

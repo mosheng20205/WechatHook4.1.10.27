@@ -3,7 +3,7 @@
 
 namespace WeixinSend
 {
-    void SendImage(const std::string& wxid, const std::string& imgPath);
+    bool SendImage(const std::string& wxid, const std::string& imgPath);
     bool SendText(const std::string& wxidorgid, const std::string& msg);
-    void DecodePic(const std::string& enc_pic_path, const std::string& dec_pic_path);
+    bool DecodePic(const std::string& enc_pic_path, const std::string& dec_pic_path);
 }

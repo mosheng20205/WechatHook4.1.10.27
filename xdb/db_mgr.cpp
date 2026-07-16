@@ -48,6 +48,21 @@ static bool SafeSqliteErrcode(sqlite3_api_routines* routines, LPVOID db, int& rc
 	}
 }
 
+static const char* SafeSqliteErrmsg(sqlite3_api_routines* routines, sqlite3* db) {
+	static thread_local char message[256];
+	message[0] = '\0';
+	if (!routines || !db || !SafeExecutablePtr(reinterpret_cast<const void*>(routines->errmsg)))
+		return message;
+	__try {
+		const char* text = routines->errmsg(db);
+		if (text)
+			strncpy_s(message, sizeof(message), text, _TRUNCATE);
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		message[0] = '\0';
+	}
+	return message;
+}
+
 static void codec_get_key(sqlite3CodecGetKey func, sqlite3* db, int index, void** pKey, int* pLen) {
 	__try {
 		func(db, index, pKey, pLen);
@@ -128,7 +143,11 @@ namespace xmgr {
 			rc = m_sqlite3Rountines->prepare((LPVOID)db, sql.c_str(), -1, &stmt, 0);
 		if (rc != SQLITE_OK) {
 			rdata["status"] = rc;
-			rdata["desc"] = format_string("execute %s failed", "sqlite3_prepare");
+			std::string desc = format_string("execute %s failed", "sqlite3_prepare");
+			const char* sqliteDesc = SafeSqliteErrmsg(m_sqlite3Rountines, db);
+			if (sqliteDesc && *sqliteDesc)
+				desc += format_string(": %s", sqliteDesc);
+			rdata["desc"] = desc;
 			return rdata;
 		}
 		nlohmann::ordered_json items = nlohmann::ordered_json::array();
@@ -176,7 +195,11 @@ namespace xmgr {
 			m_sqlite3Rountines->finalize(stmt);
 		if (stepRc != SQLITE_DONE && stepRc != SQLITE_ROW) {
 			rdata["status"] = stepRc;
-			rdata["desc"] = "sqlite3_step failed";
+			std::string desc = "sqlite3_step failed";
+			const char* sqliteDesc = SafeSqliteErrmsg(m_sqlite3Rountines, db);
+			if (sqliteDesc && *sqliteDesc)
+				desc += format_string(": %s", sqliteDesc);
+			rdata["desc"] = desc;
 		}
 		rdata["data"] = items;
 		return rdata;
