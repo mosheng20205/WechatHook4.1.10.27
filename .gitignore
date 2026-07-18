@@ -369,3 +369,6 @@ FodyWeavers.xsd
 
 # Local IDA analysis exports; keep them out of the repository.
 ida*.json
+
+# Local planning notes; keep them out of the repository.
+docs/MULTI_ACCOUNT_MANAGER_PLAN.md
