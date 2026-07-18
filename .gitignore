@@ -366,3 +366,6 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# Local IDA analysis exports; keep them out of the repository.
+ida*.json
