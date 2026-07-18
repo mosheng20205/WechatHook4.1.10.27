@@ -1,12 +1,16 @@
 #include "wx_send.h"
 #include <windows.h>
+#include <bcrypt.h>
 #include <string>
+#include <vector>
 #include <cstddef>
 #include <cstring>
 #include <ctime>
 #include <objbase.h>
 #include "global.h"
 #include "tools.h"
+
+#pragma comment(lib, "bcrypt.lib")
 
 using WeixinCall = __int64(*)(...);
 
@@ -530,37 +534,223 @@ namespace WeixinSend
 
 
 
-    bool DecodePic(const std::string& enc_pic_path, const std::string& dec_pic_path)
+    // ---- Self-implemented WeChat 4.0 "\x07\x08V2" image decryption ----
+    //
+    // Encrypted .dat layout (little-endian 15-byte header):
+    //   [0..3]  magic 07 08 56 3x  ('1' = V1, '2' = V2)
+    //   [4..5]  07 08 (constant)
+    //   [6..9]  u32 aesPlainLen  plaintext length of the AES-128-ECB region
+    //   [10..13]u32 xorLen       length of the trailing single-byte XOR region
+    //   [14]    flag (0x01)
+    // Body: [AES-128-ECB ciphertext][unencrypted middle][XOR region]
+    //   aesEncLen = fileLen - 15 - xorLen             (multiple of 16, PKCS7)
+    //   middleLen = fileLen - 15 - aesEncLen - xorLen (0 unless orig > 1KB+1MB)
+    // Both keys are per-user and derived live from WeChat's account context,
+    // mirroring the native encoder sub_1809BA970:
+    //   AES-128 key = first 16 ASCII bytes of sub_1809B1FD0(std::string*, 2)
+    //   XOR   key   = low byte of sub_1809B1F20()
+
+    // SEH-isolated: derive the 16-byte AES key. No C++ objects (C2712). The
+    // derived std::string's small heap buffer is intentionally leaked (freeing
+    // it with our allocator would fault); DecodePic is user-triggered so the
+    // per-call leak is negligible.
+    static bool DeriveImageAesKey(uintptr_t base, unsigned char* out16)
     {
+        __try {
+            unsigned char strbuf[0x20];
+            memset(strbuf, 0, sizeof(strbuf));
+            using DerivFn = void*(__fastcall*)(void*, unsigned int);
+            reinterpret_cast<DerivFn>(base + offset::img_key_derive)(strbuf, 2);
+            unsigned long long sz = *(unsigned long long*)(strbuf + 0x10);
+            if (sz < 16)
+                return false;
+            const unsigned char* p = *(const unsigned char**)strbuf;
+            memcpy(out16, p, 16);
+            return true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
+    // SEH-isolated: derive the single XOR byte via sub_1809B1F20() (no args).
+    static bool DeriveImageXorKey(uintptr_t base, unsigned char* outByte)
+    {
+        __try {
+            using XorFn = __int64(__fastcall*)();
+            __int64 r = reinterpret_cast<XorFn>(base + offset::img_xor_key)();
+            *outByte = (unsigned char)(r & 0xFF);
+            return true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
+    // AES-128-ECB block decrypt (no padding removal). inLen must be a multiple
+    // of 16; writes inLen bytes into out.
+    static bool AesEcbDecrypt(const unsigned char* key16,
+                              const unsigned char* in, unsigned long inLen,
+                              unsigned char* out, unsigned long outCap)
+    {
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_KEY_HANDLE hKey = nullptr;
+        bool ok = false;
+        if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0) < 0)
+            return false;
+        if (BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
+                (PUCHAR)BCRYPT_CHAIN_MODE_ECB,
+                sizeof(BCRYPT_CHAIN_MODE_ECB), 0) >= 0 &&
+            BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0,
+                (PUCHAR)key16, 16, 0) >= 0) {
+            ULONG cb = 0;
+            if (BCryptDecrypt(hKey, (PUCHAR)in, inLen, nullptr, nullptr, 0,
+                    out, outCap, &cb, 0) >= 0)
+                ok = true;
+        }
+        if (hKey) BCryptDestroyKey(hKey);
+        if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
+        return ok;
+    }
+
+    // Read an entire file (wide path) into buf. Caps at 200 MB.
+    static bool ReadWholeFileW(const wchar_t* path, std::vector<unsigned char>& buf)
+    {
+        HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE)
+            return false;
+        LARGE_INTEGER sz;
+        if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 ||
+            sz.QuadPart > (LONGLONG)200 * 1024 * 1024) {
+            CloseHandle(h);
+            return false;
+        }
+        buf.resize((size_t)sz.QuadPart);
+        DWORD total = 0;
+        bool ok = true;
+        while (total < buf.size()) {
+            DWORD got = 0;
+            if (!ReadFile(h, buf.data() + total, (DWORD)(buf.size() - total),
+                    &got, nullptr) || got == 0) {
+                ok = false;
+                break;
+            }
+            total += got;
+        }
+        CloseHandle(h);
+        return ok && total == buf.size();
+    }
+
+    // Write the whole buffer to a wide path, truncating any existing file.
+    static bool WriteWholeFileW(const wchar_t* path, const unsigned char* data, size_t len)
+    {
+        HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE)
+            return false;
+        size_t total = 0;
+        bool ok = true;
+        while (total < len) {
+            DWORD chunk = (DWORD)((len - total > 0x400000) ? 0x400000 : (len - total));
+            DWORD wrote = 0;
+            if (!WriteFile(h, data + total, chunk, &wrote, nullptr) || wrote == 0) {
+                ok = false;
+                break;
+            }
+            total += wrote;
+        }
+        CloseHandle(h);
+        return ok && total == len;
+    }
+
+    static std::wstring Utf8ToWide(const std::string& s)
+    {
+        std::wstring w;
+        int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+        if (n > 0) {
+            w.resize(n - 1);
+            MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
+        }
+        return w;
+    }
+
+    bool DecodePic(const std::string& enc_pic_path, const std::string& dec_pic_path,
+                   uint32_t mode, bool wide_path)
+    {
+        (void)wide_path;
+        (void)mode;
         uintptr_t base = GetWeixinDllBase();
         if (!base || enc_pic_path.empty() || dec_pic_path.empty() ||
             enc_pic_path.size() > 32768 || dec_pic_path.size() > 32768)
             return false;
 
-        uint64_t* arg1 = HeapAlloc_mb<uint64_t>(0x28);
-        if (!arg1)
+        std::wstring wsrc = Utf8ToWide(enc_pic_path);
+        std::wstring wdst = Utf8ToWide(dec_pic_path);
+        if (wsrc.empty() || wdst.empty())
             return false;
-        SetWeixinString((WeixinString*)(arg1), enc_pic_path);
 
-        uint64_t* arg2 = HeapAlloc_mb<uint64_t>(0x28);
-        if (!arg2) {
-            HeapFree(GetProcessHeap(), 0, arg1);
+        std::vector<unsigned char> buf;
+        if (!ReadWholeFileW(wsrc.c_str(), buf) || buf.size() < 15)
             return false;
+
+        // Parse the 15-byte V1/V2 header.
+        if (buf[0] != 0x07 || buf[1] != 0x08 || buf[2] != 0x56)
+            return false;  // not a WeChat encrypted image container
+        uint32_t aesPlainLen = *(const uint32_t*)(buf.data() + 6);
+        uint32_t xorLen      = *(const uint32_t*)(buf.data() + 10);
+
+        if ((size_t)15 + xorLen > buf.size())
+            return false;
+        size_t aesEncLen = buf.size() - 15 - xorLen;
+        if ((aesEncLen & 0xF) != 0)
+            return false;                        // AES region must be 16-aligned
+        if (aesPlainLen > aesEncLen)
+            aesPlainLen = (uint32_t)aesEncLen;    // clamp to available plaintext
+        size_t middleLen = buf.size() - 15 - aesEncLen - xorLen;
+
+        // Derive the per-user keys from WeChat's live account context.
+        unsigned char aeskey[16];
+        unsigned char xorkey = 0;
+        if (!DeriveImageAesKey(base, aeskey))
+            return false;
+        if (!DeriveImageXorKey(base, &xorkey))
+            return false;
+
+        // Decrypt the AES-128-ECB region.
+        std::vector<unsigned char> aesOut;
+        if (aesEncLen > 0) {
+            aesOut.resize(aesEncLen);
+            if (!AesEcbDecrypt(aeskey, buf.data() + 15, (unsigned long)aesEncLen,
+                               aesOut.data(), (unsigned long)aesEncLen))
+                return false;
         }
-        SetWeixinString((WeixinString*)(arg2), dec_pic_path);
 
+        // Assemble: [AES plaintext][unencrypted middle][XOR-decrypted region].
+        std::vector<unsigned char> out;
+        out.reserve((size_t)aesPlainLen + middleLen + xorLen);
+        out.insert(out.end(), aesOut.begin(), aesOut.begin() + aesPlainLen);
+        const unsigned char* mid = buf.data() + 15 + aesEncLen;
+        out.insert(out.end(), mid, mid + middleLen);
+        const unsigned char* xr = mid + middleLen;
+        for (size_t i = 0; i < xorLen; ++i)
+            out.push_back((unsigned char)(xr[i] ^ xorkey));
 
-        using DecodePicCall = int64_t(__fastcall*)(uint64_t, uint64_t, uint32_t);
-        DecodePicCall decodePic =
-            reinterpret_cast<DecodePicCall>(base + offset::dec_pic_call);
-        int64_t nativeResult = 0;
-        __try {
-            nativeResult = decodePic((uint64_t)arg1, (uint64_t)arg2, 1);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            return false;
+        // Lightweight diagnostic: header fields, key prefixes, output magic.
+        {
+            char line[512];
+            _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "DecodePic(v2) fileLen=%llu aesPlain=%u aesEnc=%llu mid=%llu "
+                "xorLen=%u aeskey0=%02X%02X xorkey=%02X outLen=%llu "
+                "magic=%02X%02X%02X%02X\n",
+                (unsigned long long)buf.size(), aesPlainLen,
+                (unsigned long long)aesEncLen, (unsigned long long)middleLen,
+                xorLen, aeskey[0], aeskey[1], xorkey,
+                (unsigned long long)out.size(),
+                out.size() > 0 ? out[0] : 0, out.size() > 1 ? out[1] : 0,
+                out.size() > 2 ? out[2] : 0, out.size() > 3 ? out[3] : 0);
+            OutputDebugStringA(line);
         }
-        // Weixin's caller tests the low byte of sub_180493E70's return value.
-        return static_cast<uint8_t>(nativeResult) != 0;
+
+        return WriteWholeFileW(wdst.c_str(), out.data(), out.size());
     }
 
     // ==================================================================

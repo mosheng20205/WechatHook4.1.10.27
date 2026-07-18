@@ -478,6 +478,16 @@ constexpr size_t XWECHAT_SQLITE3_CODEC_GET_KEY_FUNC = 0x4EE64D0;	//可以废弃�
 namespace offset
 {
     inline constexpr uint64_t dec_pic_call = 0x493E70;
+    // Public image-decode wrapper: normalizes wide paths (UTF-16 -> UTF-8),
+    // probes the encryption type via sub_180494860, then dispatches to the
+    // matching decoder (sub_180493E70 for the V2 "\x07\x08" format).
+    inline constexpr uint64_t dec_pic_wrapper = 0x496E30;
+    // Per-user image AES key derivation: sub_1809B1FD0(std::string* out, 2).
+    // Returns the derived key string (first 16 bytes = AES-128-ECB key).
+    inline constexpr uint64_t img_key_derive = 0x9B1FD0;
+    // Per-user image XOR key derivation: sub_1809B1F20() (no args).
+    // Returns the single XOR byte (low 8 bits) for the trailing XOR region.
+    inline constexpr uint64_t img_xor_key = 0x9B1F20;
     inline constexpr uint64_t create_param2 = 0xDF40;
     inline constexpr uint64_t send_message = 0x1677A30;
     inline constexpr uint64_t param1_vtable = 0x84EC9C8; 

@@ -176,7 +176,7 @@ powershell -ExecutionPolicy Bypass -File .\tools\test-api.ps1 -RequireLogin
 ## 当前限制
 
 - `/SendImgMsg`：图片消息 vtable(`0x84F96B8`/`0x84F9748`)已在 IDA 对 4.1.10.27 校验，复用文本发送已验证的调用链，native 调用用 SEH 包裹；返回本地入队结果，对端送达仍需真实账号验证。
-- `/Decode_Pic`：解密函数偏移(`0x493E70`)已在 IDA 对 4.1.10.27 校验并启用，native 调用用 SEH 包裹。
+- `/Decode_Pic`：自实现 WeChat 4.0 "\x07\x08V2" `.dat` 图片解密（AES-128-ECB + 尾段单字节 XOR，AES/XOR 密钥均运行时从微信账号上下文派生，偏移已在 IDA 对 4.1.10.27 校验，native 派生调用用 SEH 包裹）。已真机端到端验证：真实 `.dat` 解出可打开图片（用例1 输出标准 JPEG，与离线重建逐字节一致；用例2 输出微信专有 `wxgf` 封装格式，解密结构一致），异常输入(不存在/空文件 `ret=-1`、非加密文件 `ret=-3`)安全返回错误码且进程稳定。
 - `/ForwardXMLMsg`：appmsg/XML 链接卡片真实发送已启用并端到端验证（服务器 `ret = 0`，卡片在对话中可见，微信进程稳定无崩溃）。发送经由直接构造 `sendappmsg` CGI task 并经通用任务分发器下发；返回值代表服务器应答结果。
 - `/GetSelfProfile` 的 `area`、`signinfo`、`avatar`、`small_avatar`、`sex` 等可选字段依赖数据库，仍可能为空，不会使用猜测偏移填充。
 - `/SendTextMsg` 已验证本地发送入队和自动回复链路，返回值仅表示进入本地发送队列，不代表微信服务端或对端已送达。
@@ -191,6 +191,8 @@ powershell -ExecutionPolicy Bypass -File .\tools\test-api.ps1 -RequireLogin
 - [个人资料](docs/SELF_PROFILE_NOTES_4.1.10.27.md)
 - [接收消息](docs/RECEIVE_MESSAGE_NOTES_4.1.10.27.md)
 - [发送消息](docs/SEND_MESSAGE_NOTES_4.1.10.27.md)
+- [XML 卡片发送](docs/SEND_XML_NOTES_4.1.10.27.md)
+- [图片解密](docs/DECODE_PIC_NOTES_4.1.10.27.md)
 
 ## 安全约束
 

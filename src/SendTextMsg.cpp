@@ -99,7 +99,8 @@ void Route_SendTextMsg(httplib::Server& svr)
             OutputDebugStringA(("Decode_Pic dst_path: " + dst_path + "\n").c_str());
 
 
-            const bool ok = WeixinSend::DecodePic(src_path, dst_path);
+            const bool ok = WeixinSend::DecodePic(src_path, dst_path,
+                reqJson.value("mode", 1u), reqJson.value("wide", true));
 
 
             resp["ret"] = ok ? 0 : -3;

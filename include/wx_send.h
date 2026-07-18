@@ -5,7 +5,8 @@ namespace WeixinSend
 {
     bool SendImage(const std::string& wxid, const std::string& imgPath);
     bool SendText(const std::string& wxidorgid, const std::string& msg);
-    bool DecodePic(const std::string& enc_pic_path, const std::string& dec_pic_path);
+    bool DecodePic(const std::string& enc_pic_path, const std::string& dec_pic_path,
+                   uint32_t mode = 1, bool wide_path = true);
 
     // appmsg/XML (msgtype 49) send on the VERIFIED sendappmsg CGI submit path
     // (WeChat 4.1.10.27).  Natively default-constructs the nested protobuf
