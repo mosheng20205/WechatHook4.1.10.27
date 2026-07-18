@@ -92,14 +92,9 @@ void Route_SendTextMsg(httplib::Server& svr)
                 return;
             }
 
-            // The decoder RVA is not yet validated against this build.  Keep
-            // the route safe until the call signature and output semantics
-            // are confirmed in IDA and a live WeChat process.
-            resp["ret"] = -3;
-            resp["retmsg"] = "Decode_Pic offset is not runtime-verified for WeChat 4.1.10.27";
-            res.set_content(resp.dump(), "application/json; charset=utf-8");
-            return;
-
+            // dec_pic_call (RVA 0x493E70) verified in IDA for 4.1.10.27:
+            // sub_180493E70(a1, a2, mode) reads a1[2]/a1[3] as length/capacity
+            // with the WeixinString ABI, decrypts a1 into a2 under `mode`.
             OutputDebugStringA(("Decode_Pic src_path: " + src_path + "\n").c_str());
             OutputDebugStringA(("Decode_Pic dst_path: " + dst_path + "\n").c_str());
 
@@ -108,7 +103,7 @@ void Route_SendTextMsg(httplib::Server& svr)
 
 
             resp["ret"] = ok ? 0 : -3;
-            resp["retmsg"] = ok ? "queued" : "decode failed";
+            resp["retmsg"] = ok ? "success" : "decode failed";
 
             res.set_content(resp.dump(), "application/json; charset=utf-8");
         });

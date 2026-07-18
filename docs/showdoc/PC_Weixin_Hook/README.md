@@ -1,5 +1,19 @@
 # PC_Weixin_Hook
 
+> ⚠️ **旧版参考文档（非本项目当前实现）**
+>
+> 本目录整体导出自第三方 ShowDoc，仅作为接口形态与字段命名的历史参考。
+> 它面向的是更早期的微信 Hook 版本，**与本仓库 4.1.10.27 源码不对应**。
+> 当前源码实际注册的路由仅为：`/GetContacts`、`/GetContact`、
+> `/GetSelfProfile`、`/SendTextMsg`、`/SendImgMsg`、`/ForwardXMLMsg`
+> （偏移失效，安全拒绝）、`/Decode_Pic`、
+> `/AutoReply/config`（GET/POST）、`/AutoReply/rules`（GET/POST）、
+> `/QueryDB/GetAllDBName`、`/QueryDB/execute`、`/QueryDB/status`。
+> 本文档中出现的好友管理、群管理、朋友圈、红包、CDN 上下传、公众号/服务号、
+> 小程序、视频号/搜一搜/直播间、OCR、发自定义包等接口**当前源码均未实现**，
+> 请以仓库根目录 [README.md](../../../README.md) 与 `docs/*_NOTES_4.1.10.27.md`
+> 为准。
+
 Automatically exported from [ShowDoc](https://www.showdoc.com.cn/PCWeixinHook/11559060626558382).
 
 - **登录与退出**

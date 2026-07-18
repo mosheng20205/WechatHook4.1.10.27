@@ -109,6 +109,74 @@ extern volatile uint64_t g_SendElementObserveLastField1Wrapper;
 extern char g_SendElementObserveField1[4096];
 extern char g_SendElementObserveField10[4096];
 extern char g_SendElementObserveField20[4096];
+// Read-only observation of the verified unified send_message path.  These
+// fields are populated by scanning the live content object used by a real
+// send (including appmsg/XML forwarding); no send arguments are modified.
+extern volatile uint64_t g_SendContentObserveCalls;
+extern volatile uint64_t g_SendContentObserveLastArg1;
+extern volatile uint64_t g_SendContentObserveLastArg2;
+extern volatile uint64_t g_SendContentObserveLastObject;
+extern volatile uint64_t g_SendContentObserveLastVtable;
+extern volatile uint64_t g_SendContentObserveReceiverOffset;
+extern volatile uint64_t g_SendContentObserveContentOffset;
+extern volatile uint64_t g_SendContentObserveHookInstalled;
+extern char g_SendContentObserveReport[16384];
+// Armable XML-forward capture snapshot layered on the unified send observer
+// above.  Default DISARMED => zero behavioral change (the observer already runs
+// read-only).  While armed, the first appmsg/XML content object seen is frozen
+// into these fields (vtable RVA, XML-body offset, receiver-wxid offset, field
+// map) and the probe self-disarms so a subsequent text/image send cannot
+// overwrite the capture.  Consumed via /XmlProbe/result and /QueryDB/status.
+extern volatile uint64_t g_XmlProbeArmed;
+extern volatile uint64_t g_XmlProbeCaptured;
+extern volatile uint64_t g_XmlProbeSendCalls;
+extern volatile uint64_t g_XmlProbeVtableRva;
+extern volatile uint64_t g_XmlProbeXmlOffset;   // UINT64_MAX = unset
+extern volatile uint64_t g_XmlProbeWxidOffset;  // UINT64_MAX = unset
+extern char g_XmlProbeFieldMap[16384];
+// Forward/resend appmsg source observer.  Hooks the copy-from-source content
+// factory (Weixin.dll+0x1741640) whose 2nd arg carries the ORIGINAL message
+// send-source object; the forward path (unlike text/image compose) never goes
+// through the unified send_message boundary.  Arm-gated with g_XmlProbeArmed:
+// while armed, the first forwarded appmsg whose source exposes an XML body is
+// frozen into the g_XmlProbe* fields above.  Default disarmed => passthrough.
+extern volatile uint64_t g_ForwardObserveCalls;
+extern volatile uint64_t g_ForwardObserveHookInstalled;
+// Read-only, arm-gated observation of the sendappmsg CGI submit primitive
+// (Weixin.dll RVA 0x36AF120).  a1 = network manager, a2 = structured
+// SendAppMsgReq protobuf object, a4 = endpoint config struct.  While armed
+// (via /AppMsgProbe/arm) the first submit is frozen (manager + request layout
+// hex/string map) so the real appmsg send can be replayed.  Default disarmed
+// => only a call counter increments and the original submit is passed through.
+extern volatile uint64_t g_AppMsgSubmitArmed;
+extern volatile uint64_t g_AppMsgSubmitCaptured;
+extern volatile uint64_t g_AppMsgSubmitCalls;
+extern volatile uint64_t g_AppMsgSubmitHookInstalled;
+extern volatile uint64_t g_AppMsgSubmitManager;
+// Generic CGI task-dispatch observer (manager->vtable[5], Weixin.dll+0x304F80):
+// fires on EVERY CGI dispatch (login/sync/contacts/sendappmsg), so the live
+// network manager is captured without a manual card send.
+extern volatile uint64_t g_TaskDispatchCalls;
+extern volatile uint64_t g_TaskDispatchHookInstalled;
+// Persistent clone of the first real complete SendAppMsgRequest, produced via
+// WeChat's own ctor + deep-copy at the F120 observer hook.  SendAppMsg swaps
+// only the appmsg recipient/content/clientmsgid on this template and replays
+// it (F120 deep-copies the template into its task, so it is reusable).
+extern volatile uint64_t g_AppMsgTemplate;
+extern volatile uint64_t g_AppMsgSubmitRequestObj;
+extern volatile uint64_t g_AppMsgSubmitRequestVtable;
+extern volatile uint64_t g_AppMsgSubmitA3;
+extern volatile uint64_t g_AppMsgSubmitA4;
+extern volatile uint64_t g_AppMsgSubmitA5;
+extern char g_AppMsgSubmitReport[65536];
+// SendAppMsg (custom-vtable CGI task) diagnostics.
+extern volatile uint64_t g_AppMsgSendCalls;      // SubmitAppMsgTask entered
+extern volatile uint64_t g_AppMsgDispatchOk;     // dispatch returned without SEH
+extern volatile uint64_t g_AppMsgDispatchFail;   // dispatch threw (SEH caught)
+extern volatile uint64_t g_AppMsgSerializeCalls; // our serialize slot fired
+extern volatile uint64_t g_AppMsgResponseCalls;  // our response slot fired
+extern volatile uint64_t g_AppMsgLastRespSize;   // last response holder size
+extern volatile int64_t  g_AppMsgLastRet;        // last parsed BaseResponse.ret
 extern volatile uint64_t g_SysMsgParserCalls;
 extern volatile uint64_t g_HistoryAddMsgCalls;
 extern volatile uint64_t g_HistoryAddMsgCommitCalls;
@@ -422,10 +490,130 @@ namespace offset
     inline constexpr uintptr_t txt_message_vtbl = 0x8279358;
     inline constexpr uint64_t img_msg_vtbl = 0x84F96B8; 
     inline constexpr uint64_t img_msg_vtb2 = 0x84F9748;
+    // Verified via content-object factory sub_182A1AC80 (see notes below):
+    inline constexpr uint64_t video_msg_vtbl = 0x84F9888;   // "VideoMessageSendSource"
+    // Candidate appmsg/XML (msgtype 49) content vtable = generic
+    // "MessageSendSource" base; 0x718-byte (1816) object.
+    inline constexpr uint64_t appmsg_base_vtbl = 0x84F9A78;
+    // Verified default factory for the generic MessageSendSource base
+    // (sub_7FFE90C092B0, one of the 4 xrefs that write vtable 0x84F9A78):
+    // allocates 1816 bytes, sets vtable@+0 and refcount 0x100000001@+8,
+    // constructs the base sub-object at wrapper+0x10 via sub_7FFE8F012D30,
+    // and returns a shared_ptr pair {obj* (=wrapper+0x10), ctrl* (=wrapper)}
+    // in the caller-supplied 2-qword out buffer.  Base sub-object layout
+    // (IDA-derived from the base ctor + verified against the TextMessage
+    // struct in wx_send.cpp): WeixinString slots at 0x18/0x38/0x58/0x78/
+    // 0xB0/0x108/0x148/0x168/0x190/0x6A8/0x6C8/0x6E8; receiver@0xB0,
+    // msgtype@0xD8, uuid@0x6A8.  copy-from-source (forward) preserves
+    // 0x38/0x58/0x78 and resets receiver@0xB0, so the appmsg XML body is
+    // one of 0x38/0x58/0x78 -- swept at runtime via /ForwardXMLMsg.
+    inline constexpr uint64_t appmsg_default_ctor = 0x46A92B0;
+
+    // ==== Verified sendappmsg CGI submit path (WeChat 4.1.10.27) ====
+    // Reverse-engineered + runtime-captured via the F120 observer hook.
+    // sendappmsg submit primitive (sub_7FFE9200F120): hardcodes
+    // "/cgi-bin/micromsg-bin/sendappmsg" (cgi type 222), deep-copies the
+    // caller's structured SendAppMsgRequest via sub_7FFE92DCC3D0 (CopyFrom,
+    // const source => read-only), and dispatches through the network manager.
+    inline constexpr uint64_t appmsg_submit = 0x36AF120;
+    // SendAppMsgRequest default ctor (sub_7FFE92DB1B00): vtable 0x8A57138.
+    // Sub-message pointers base@+0x08 / appmsg@+0x10 (has-bits dword @ +0x5C,
+    // bit0x01=base, bit0x02=appmsg).
+    inline constexpr uint64_t sendappmsg_req_ctor = 0x4451B00;
+    // AppMsg sub-message default ctor (sub_7FFE92DB1AA0): vtable 0x8A570C8,
+    // 120-byte object, has-bits dword @ +0x70.  ArenaStringPtr string fields:
+    // fromusername@+0x08(0x01), tousername@+0x18(0x08), type int@+0x24(0x10),
+    // content@+0x28(0x20), clientmsgid@+0x30(0x80).
+    inline constexpr uint64_t appmsg_msg_ctor = 0x4451AA0;
+    // BaseRequest sub-message default ctor (sub_7FFE8EF3A8A0): vtable
+    // 0x82651E8, 56-byte object, has-bits dword @ +0x30; default-constructs
+    // empty (no session data required).
+    inline constexpr uint64_t sendappmsg_base_ctor = 0x5DA8A0;
+    // SendAppMsgRequest deep-copy primitive (sub_7FFE92DCC3D0): calls
+    // dest->Clear() then copy-assign (sub_7FFE92DCAC60), which deep-copies
+    // every set field per the has-bits.  Used to clone the first real,
+    // complete request into a persistent template so SendAppMsg replays a
+    // fully-valid SendAppMsgRequest (valid BaseRequest session + all required
+    // scalar fields) and only swaps the appmsg recipient/content/clientmsgid.
+    inline constexpr uint64_t sendappmsg_req_copy = 0x446C3D0;
+
+    // ==== Custom-vtable sendappmsg CGI task (WeChat 4.1.10.27) ====
+    // Real-send path that NEVER hands WeChat a native protobuf object to
+    // serialize (the async serialize of a native SendAppMsgRequest crashed the
+    // worker at Weixin.dll+0x46a92e3).  Instead WeixinSend::SendAppMsg builds
+    // the CGI task exactly like the native submit primitive, then overrides
+    // the task vtable so the serialize slot emits hand-serialized protobuf
+    // bytes and the response slot captures the reply; the task is dispatched
+    // through the live manager (g_AppMsgSubmitManager) via manager->vtable[5]
+    // and intentionally leaked (custom no-op dtor) to avoid any
+    // cross-allocator free / uninitialised-field destruct.
+    //
+    // Task ctor sub_7FFE9200F460: cgi type<-task_info+16, endpoint<-task_info
+    // +24, empty inner request built @task+240, response holder @task+208,
+    // state=3.  Task vtable off_7FFE97216F98 = 6 slots
+    // [dtor, serialize, response, getinner(->task+240), dummy, literal 1].
+    inline constexpr uint64_t appmsg_task_ctor   = 0x36AF460;
+    // Holder helpers used by the serialize/response slots (sub_7FFE8EF3A760 /
+    // sub_7FFE8EF3A7D0 / sub_7FFE8EF3A7A0): append bytes to the output holder,
+    // read the response holder size, and read the response holder data ptr.
+    inline constexpr uint64_t appmsg_holder_write = 0x5DA760;
+    inline constexpr uint64_t appmsg_holder_size  = 0x5DA7D0;
+    inline constexpr uint64_t appmsg_holder_data  = 0x5DA7A0;
 }
 
 
-//4.1.5.30  xml
+// XML-forwarding offsets below were reverse-engineered against WeChat
+// 4.1.5.30 and are CONFIRMED STALE for 4.1.10.27 via IDA (imagebase
+// 0x180000000, so RVA R decompiles at 0x180000000+R):
+//   * FORWARD_XML_CALL (RVA 0x1CF3D20 -> 0x181CF3D20) is NOT a function
+//     entry on 4.1.10.27: it lands 0xD80 bytes inside sub_181CF2FA0, a Qt
+//     UI-layout routine (refs "splitter_left_min_width",
+//     "main_window_mask_margin", QArrayData) -- not a message-forward call.
+//   * The hardcoded rdx+0x20 reference g_weixinBase+0x367849 (0x180367849)
+//     lands in the middle of sub_1803677F0, not a data target.
+// Calling/using them on 4.1.10.27 would jump into unrelated UI code and
+// crash Weixin.exe.  The forward-XML object graph (12 vtables + forward
+// call + field offsets) has no symbol/string anchor to relocate reliably by
+// static analysis alone, and per the project guardrail an enabled send Hook
+// requires runtime verification on a live client.  ForwardXmlMessage stays
+// behind a safe early-return in ForwardXMLMsg.cpp until these are re-derived
+// and runtime-verified.
+//
+// Relocation anchors gathered via IDA for a future runtime-verification pass:
+//   * Message send/forward is VIRTUAL DISPATCH per message class.  The
+//     verified text-send sub_181677A30 is slot +0x10 of the text param-class
+//     vtable at 0x1884EC9C8 (offset::param1_vtable 0x84EC9C8); slots are
+//     {+0x00 sub_1816778E0, +0x08 sub_18000A820, +0x10 send sub_181677A30,
+//      +0x18 sub_181677F00, +0x20 sub_181677F10, +0x28 sub_180009760}.
+//   * The verified send path (SendText/SendImage) is: build a *content
+//     object* whose vtable selects the message class, wrap it with
+//     offset::param1_vtable (0x84EC9C8) + BuildSendParam2, then call the
+//     single verified send_message (offset::send_message 0x1677A30).  XML
+//     forwarding must be re-implemented on this same path, NOT the dead
+//     4.1.5.30 FORWARD_XML_CALL object graph below.
+//   * Content-object factory sub_182A1AC80 (RVA 0x2A1AC80) dispatches by the
+//     serialized "<Type>MessageSendSource" type-name string (switch on
+//     std::string length via pcmpeqb; jumptable jpt_182A1B119 @ 0x18876DE1C).
+//     Verified case -> content vtable (RVA):
+//       len 17 "MessageSendSource"      -> 0x84F9A78  (generic base, 0x718 obj,
+//                                                       ctor sub_1806B4470)
+//       len 21 "TextMessageSendSource"  -> 0x8279358  (== offset::txt_message_vtbl)
+//       len 22 "ImageMessageSendSource" -> 0x84F96B8  (== offset::img_msg_vtbl)
+//       len 22 "VideoMessageSendSource" -> 0x84F9888  (NEW: video content vtable)
+//       len 32 "ChatInputTempApp..."    -> loc_182A1B464
+//     There is NO dedicated "AppMessageSendSource" case (len 20 falls to the
+//     default/error branch def_182A1B119).  The appmsg/XML (msgtype 49)
+//     content is therefore most likely built on the generic
+//     "MessageSendSource" base (vtable 0x84F9A78), but the 0x718-byte object
+//     field layout (XML-content string, receiver wxid, appmsg type field) is
+//     NOT derivable by static analysis and, per the project guardrail, must
+//     be confirmed by runtime tracing on a live 4.1.10.27 client before an
+//     enabled send Hook can be shipped.
+//   * RTTI class-name strings are ENCRYPTED (typeDescriptor at 0x18A252F30
+//     for the text class is non-ASCII), so the appmsg class cannot be found
+//     by name statically -- confirming the layout needs runtime tracing of
+//     an actual forward on a live 4.1.10.27 client.
+//4.1.5.30  xml (UNVERIFIED / STALE for 4.1.10.27)
 namespace Offsets
 {
     inline constexpr uintptr_t IMAGE_FIELD_VTABLE = 0x80D1098;          //ok  41930 ? 41923

@@ -27,6 +27,7 @@
 #include "hook_xlog.h"
 #include "http_post.h"
 #include "wx_send.h"
+#include "auto_reply.h"
 #include "../xdb/sqlite3.h"
 #include "../xdb/db_mgr.h"
 
@@ -240,6 +241,12 @@ using FnSendMsgElementCopy = int64_t(__fastcall*)(void* destination,
                                                    void* arena);
 static FnSendMsgElementCopy g_OriginalSendMsgElementCopy = nullptr;
 static LONG g_SendMsgElementObserveHookState = 0;
+// Verified unified text/image send entry (Weixin.dll RVA 0x1677A30).
+// This observer only inspects the caller-owned content object and always
+// forwards the exact native return value.
+using FnUnifiedSendMessage = int64_t(__fastcall*)(void* arg1, void* arg2);
+static FnUnifiedSendMessage g_OriginalUnifiedSendMessage = nullptr;
+static LONG g_UnifiedSendMessageObserveHookState = 0;
 using FnSyncDispatcher = int64_t(__fastcall*)(int64_t);
 static FnSyncDispatcher g_OriginalSyncDispatcher = nullptr;
 static LONG g_SyncDispatcherHookState = 0;
@@ -2511,6 +2518,628 @@ static void InstallSendMsgElementObserverHook()
     }
 }
 
+// Read one WeixinString without calling any WeChat code.  The send content
+// objects use the same 16-byte inline / heap-backed representation as the
+// already verified text sender.
+static bool ReadObservedWeixinString(uintptr_t address, char* dst, size_t cap,
+                                     uint64_t* lengthOut)
+{
+    if (!dst || cap == 0 || !address ||
+        !IsReadablePointer(reinterpret_cast<const void*>(address)))
+        return false;
+    dst[0] = 0;
+    HookNativeString value{};
+    __try {
+        value = *reinterpret_cast<const HookNativeString*>(address);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    if (value.length == 0 || value.length >= cap || value.length > 0x8000 ||
+        value.capacity < value.length || value.capacity > 0x100000)
+        return false;
+
+    const char* source = nullptr;
+    if (value.capacity >= 0x10) {
+        source = value.heap_buf;
+        if (!source || !IsReadablePointer(source))
+            return false;
+    } else {
+        if (value.length > 0x0F)
+            return false;
+        source = value.inline_buf;
+    }
+
+    __try {
+        memcpy(dst, source, static_cast<size_t>(value.length));
+        dst[value.length] = 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        dst[0] = 0;
+        return false;
+    }
+    if (lengthOut)
+        *lengthOut = value.length;
+    return true;
+}
+
+static bool LooksLikeObservedReceiver(const char* value)
+{
+    return value && (*value != '<') &&
+        (strstr(value, "wxid_") || strstr(value, "@chatroom") ||
+         strstr(value, "gh_") || strcmp(value, "filehelper") == 0);
+}
+
+static bool LooksLikeObservedXml(const char* value)
+{
+    if (!value || *value != '<')
+        return false;
+    return strstr(value, "<msg") || strstr(value, "<appmsg") ||
+        strstr(value, "<img") || strstr(value, "<videomsg") ||
+        strstr(value, "<emoji") || strstr(value, "<url") ||
+        strstr(value, "</msg>");
+}
+
+// Persist a captured XML-probe result to OutputDebugString + xml_offsets.log.
+// Kept out of the SEH-guarded observer so the std::wstring path (which needs
+// C++ unwinding) does not conflict with __try in the same function.
+static void WriteXmlProbeCaptureLog(uint64_t vtableRva, uint64_t xmlOffset,
+                                    uint64_t wxidOffset, const char* report)
+{
+    OutputDebugStringA("[XmlProbe] captured appmsg/XML send content object\n");
+    if (report)
+        OutputDebugStringA(report);
+    if (g_MyDir.empty())
+        return;
+    const std::wstring logPath = g_MyDir + L"\\xml_offsets.log";
+    HANDLE h = CreateFileW(logPath.c_str(), FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+    DWORD wrote = 0;
+    char header[160];
+    const int hn = snprintf(header, sizeof(header),
+        "vtable_rva=0x%llX xml_offset=0x%llX wxid_offset=0x%llX\n",
+        static_cast<unsigned long long>(vtableRva),
+        static_cast<unsigned long long>(xmlOffset),
+        static_cast<unsigned long long>(wxidOffset));
+    if (hn > 0)
+        WriteFile(h, header, static_cast<DWORD>(hn), &wrote, nullptr);
+    if (report)
+        WriteFile(h, report, static_cast<DWORD>(strlen(report)), &wrote, nullptr);
+    CloseHandle(h);
+}
+
+static void ObserveUnifiedSendContent(void* arg1, void* arg2)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_SendContentObserveCalls));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendContentObserveLastArg1),
+                          static_cast<LONG64>(reinterpret_cast<uintptr_t>(arg1)));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendContentObserveLastArg2),
+                          static_cast<LONG64>(reinterpret_cast<uintptr_t>(arg2)));
+    if (g_XmlProbeArmed)
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_XmlProbeSendCalls));
+
+    uintptr_t data = 0;
+    uintptr_t object = 0;
+    uintptr_t vtable = 0;
+    __try {
+        if (arg1)
+            data = *reinterpret_cast<const uintptr_t*>(
+                reinterpret_cast<uintptr_t>(arg1) + 0x08);
+        if (data)
+            object = *reinterpret_cast<const uintptr_t*>(data);
+        if (object >= 0x10)
+            vtable = *reinterpret_cast<const uintptr_t*>(object - 0x10);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        data = 0;
+        object = 0;
+        vtable = 0;
+    }
+
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendContentObserveLastObject),
+                          static_cast<LONG64>(object));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendContentObserveLastVtable),
+                          static_cast<LONG64>(vtable));
+    if (!object || !IsReadablePointer(reinterpret_cast<const void*>(object)))
+        return;
+
+    char report[sizeof(g_SendContentObserveReport)]{};
+    int used = snprintf(report, sizeof(report),
+                        "arg1=0x%llX arg2=0x%llX data=0x%llX object=0x%llX vtable=0x%llX\n",
+                        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(arg1)),
+                        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(arg2)),
+                        static_cast<unsigned long long>(data),
+                        static_cast<unsigned long long>(object),
+                        static_cast<unsigned long long>(vtable));
+    if (used < 0)
+        return;
+    if (used >= static_cast<int>(sizeof(report)))
+        used = static_cast<int>(sizeof(report) - 1);
+
+    uint64_t receiverOffset = UINT64_MAX;
+    uint64_t contentOffset = UINT64_MAX;
+    bool foundInteresting = false;
+    // The verified text layout places receiver/content at +0xB0/+0x708;
+    // scan the same bounded object range to capture the appmsg layout.
+    for (size_t offset = 0; offset <= 0x1000; offset += 8) {
+        char value[8192]{};
+        uint64_t length = 0;
+        if (!ReadObservedWeixinString(object + offset, value, sizeof(value), &length))
+            continue;
+        if (!LooksLikeObservedReceiver(value) && !LooksLikeObservedXml(value))
+            continue;
+
+        foundInteresting = true;
+        if (receiverOffset == UINT64_MAX && LooksLikeObservedReceiver(value))
+            receiverOffset = static_cast<uint64_t>(offset);
+        if (contentOffset == UINT64_MAX && LooksLikeObservedXml(value))
+            contentOffset = static_cast<uint64_t>(offset);
+
+        if (used < static_cast<int>(sizeof(report) - 32)) {
+            const int written = snprintf(report + used, sizeof(report) - used,
+                                         "field+0x%zX len=%llu value=%s\n",
+                                         offset,
+                                         static_cast<unsigned long long>(length),
+                                         value);
+            if (written > 0)
+                used += (written < static_cast<int>(sizeof(report) - used))
+                    ? written : static_cast<int>(sizeof(report) - used - 1);
+        }
+    }
+
+    if (foundInteresting) {
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendContentObserveReceiverOffset),
+                              static_cast<LONG64>(receiverOffset));
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendContentObserveContentOffset),
+                              static_cast<LONG64>(contentOffset));
+    }
+    CopySafeText(report, g_SendContentObserveReport,
+                 sizeof(g_SendContentObserveReport));
+
+    // Armable one-shot XML-forward capture (read-only; default disarmed).  Only
+    // freezes when a real appmsg/XML body was seen, then self-disarms so a later
+    // text/image send cannot clobber the snapshot consumed by /XmlProbe/result.
+    if (g_XmlProbeArmed && !g_XmlProbeCaptured &&
+        foundInteresting && contentOffset != UINT64_MAX)
+    {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(g_hWeixinDll);
+        const uint64_t vtableRva = (vtable && vtable > base) ? (vtable - base) : 0;
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_XmlProbeVtableRva),
+                              static_cast<LONG64>(vtableRva));
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_XmlProbeXmlOffset),
+                              static_cast<LONG64>(contentOffset));
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_XmlProbeWxidOffset),
+                              static_cast<LONG64>(receiverOffset));
+        CopySafeText(report, g_XmlProbeFieldMap, sizeof(g_XmlProbeFieldMap));
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_XmlProbeCaptured), 1);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_XmlProbeArmed), 0);
+        WriteXmlProbeCaptureLog(vtableRva, contentOffset, receiverOffset, report);
+    }
+}
+
+static int64_t __fastcall Hook_UnifiedSendMessage(void* arg1, void* arg2)
+{
+    ObserveUnifiedSendContent(arg1, arg2);
+    return g_OriginalUnifiedSendMessage
+        ? g_OriginalUnifiedSendMessage(arg1, arg2) : 0;
+}
+
+static void InstallUnifiedSendMessageObserverHook()
+{
+    if (InterlockedCompareExchange(&g_UnifiedSendMessageObserveHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x1677A30);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_UnifiedSendMessage),
+                      reinterpret_cast<void**>(&g_OriginalUnifiedSendMessage)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK)
+    {
+        g_OriginalUnifiedSendMessage = nullptr;
+        InterlockedExchange(&g_UnifiedSendMessageObserveHookState, 0);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendContentObserveHookInstalled), 0);
+    }
+    else
+    {
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SendContentObserveHookInstalled), 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Outgoing send-source observer (read-only, arm-gated).
+//
+// The text/image compose path flows through the unified send_message boundary
+// observed above, but forwarding/sharing an appmsg does NOT.  All outgoing
+// messages instead converge at the "start send" dispatcher Weixin.dll+0x628E6B0
+// (IDA sub_7FFE94BEE6B0, self-identified by its "send sources invalid when
+// start send" error string).  Its 1st argument is the send-context object; the
+// send-sources vector lives at contextObj+0x70 as { begin, end, cap }, and the
+// first element's first qword is the source object (wrapper: vtable@+0 =
+// appmsg vtable 0x84F9A78, base fields at +0x10 so base +0x38/+0x58/+0x78 land
+// at wrapper +0x48/+0x68/+0x88).  While armed (via /XmlProbe/arm) we scan that
+// source object once and freeze the XML/receiver offsets into the shared
+// g_XmlProbe* fields.  Default disarmed => only a counter increments.
+static void ObserveForwardSourceContent(void* sendContext)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_ForwardObserveCalls));
+    if (!g_XmlProbeArmed || g_XmlProbeCaptured || !sendContext)
+        return;
+
+    uintptr_t object = 0;   // send-source wrapper (vtable@+0)
+    uintptr_t vtable = 0;
+    uintptr_t vec = 0, begin = 0, end = 0;
+    __try {
+        // contextObj+0x70 -> send-sources vector { begin, end, cap }.
+        vec = *reinterpret_cast<const uintptr_t*>(
+            reinterpret_cast<uintptr_t>(sendContext) + 0x70);
+        if (vec && IsReadablePointer(reinterpret_cast<const void*>(vec))) {
+            begin = *reinterpret_cast<const uintptr_t*>(vec);
+            end   = *reinterpret_cast<const uintptr_t*>(vec + 8);
+            if (begin && end != begin &&
+                IsReadablePointer(reinterpret_cast<const void*>(begin))) {
+                object = *reinterpret_cast<const uintptr_t*>(begin);
+                if (object &&
+                    IsReadablePointer(reinterpret_cast<const void*>(object)))
+                    vtable = *reinterpret_cast<const uintptr_t*>(object);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        object = 0;
+        vtable = 0;
+    }
+
+    // Always publish the deref outcome so a missed/partial forward stays
+    // diagnosable via /XmlProbe/result even when no source object was found.
+    {
+        char diag[256];
+        snprintf(diag, sizeof(diag),
+                 "startsend ctx=0x%llX vec=0x%llX begin=0x%llX end=0x%llX object=0x%llX vtable=0x%llX\n",
+                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(sendContext)),
+                 static_cast<unsigned long long>(vec),
+                 static_cast<unsigned long long>(begin),
+                 static_cast<unsigned long long>(end),
+                 static_cast<unsigned long long>(object),
+                 static_cast<unsigned long long>(vtable));
+        CopySafeText(diag, g_XmlProbeFieldMap, sizeof(g_XmlProbeFieldMap));
+    }
+
+    if (!object || !IsReadablePointer(reinterpret_cast<const void*>(object)))
+        return;
+
+    char report[sizeof(g_XmlProbeFieldMap)]{};
+    int used = snprintf(report, sizeof(report),
+                        "startsend ctx=0x%llX object=0x%llX vtable=0x%llX\n",
+                        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(sendContext)),
+                        static_cast<unsigned long long>(object),
+                        static_cast<unsigned long long>(vtable));
+    if (used < 0)
+        return;
+    if (used >= static_cast<int>(sizeof(report)))
+        used = static_cast<int>(sizeof(report) - 1);
+
+    uint64_t receiverOffset = UINT64_MAX;
+    uint64_t contentOffset = UINT64_MAX;
+    bool foundInteresting = false;
+    for (size_t offset = 0; offset <= 0x1000; offset += 8) {
+        char value[8192]{};
+        uint64_t length = 0;
+        if (!ReadObservedWeixinString(object + offset, value, sizeof(value), &length))
+            continue;
+        if (!LooksLikeObservedReceiver(value) && !LooksLikeObservedXml(value))
+            continue;
+
+        foundInteresting = true;
+        if (receiverOffset == UINT64_MAX && LooksLikeObservedReceiver(value))
+            receiverOffset = static_cast<uint64_t>(offset);
+        if (contentOffset == UINT64_MAX && LooksLikeObservedXml(value))
+            contentOffset = static_cast<uint64_t>(offset);
+
+        if (used < static_cast<int>(sizeof(report) - 32)) {
+            const int written = snprintf(report + used, sizeof(report) - used,
+                                         "field+0x%zX len=%llu value=%s\n",
+                                         offset,
+                                         static_cast<unsigned long long>(length),
+                                         value);
+            if (written > 0)
+                used += (written < static_cast<int>(sizeof(report) - used))
+                    ? written : static_cast<int>(sizeof(report) - used - 1);
+        }
+    }
+
+    // Always publish the scan so a no-XML forward is still diagnosable.
+    CopySafeText(report, g_XmlProbeFieldMap, sizeof(g_XmlProbeFieldMap));
+    if (foundInteresting && contentOffset != UINT64_MAX) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(g_hWeixinDll);
+        const uint64_t vtableRva = (vtable && vtable > base) ? (vtable - base) : 0;
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_XmlProbeVtableRva),
+                              static_cast<LONG64>(vtableRva));
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_XmlProbeXmlOffset),
+                              static_cast<LONG64>(contentOffset));
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_XmlProbeWxidOffset),
+                              static_cast<LONG64>(receiverOffset));
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_XmlProbeCaptured), 1);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_XmlProbeArmed), 0);
+        WriteXmlProbeCaptureLog(vtableRva, contentOffset, receiverOffset, report);
+    }
+}
+
+typedef int64_t (__fastcall* StartSendDispatcher_t)(void* a1, void* a2, void* a3);
+static StartSendDispatcher_t g_OriginalForwardSourceFactory = nullptr;
+static volatile LONG g_ForwardSourceObserveHookState = 0;
+
+static int64_t __fastcall Hook_ForwardSourceFactory(void* a1, void* a2, void* a3)
+{
+    ObserveForwardSourceContent(a1);
+    return g_OriginalForwardSourceFactory
+        ? g_OriginalForwardSourceFactory(a1, a2, a3) : 0;
+}
+
+static void InstallForwardSourceObserverHook()
+{
+    if (InterlockedCompareExchange(&g_ForwardSourceObserveHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x628E6B0);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_ForwardSourceFactory),
+                      reinterpret_cast<void**>(&g_OriginalForwardSourceFactory)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK)
+    {
+        g_OriginalForwardSourceFactory = nullptr;
+        InterlockedExchange(&g_ForwardSourceObserveHookState, 0);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ForwardObserveHookInstalled), 0);
+    }
+    else
+    {
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_ForwardObserveHookInstalled), 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sendappmsg CGI submit observer (read-only, arm-gated).
+//
+// sub_7FFE9200F120 (Weixin.dll+0x36AF120) is the dedicated sendappmsg submit
+// primitive: it hardcodes "/cgi-bin/micromsg-bin/sendappmsg" (cgi type 222),
+// allocates the 440-byte CGI task, copies the caller's STRUCTURED protobuf
+// request via sub_7FFE92DCC3D0(task, a2), then dispatches it through the
+// network manager with (*(a1+40))(a1, task).  Signature:
+//   (a1 = network manager, a2 = SendAppMsgReq protobuf object,
+//    a3 = client string, a4 = endpoint config struct, a5 = response ctx).
+// While armed (via /AppMsgProbe/arm) the first invocation is frozen: we record
+// a1..a5, a2's vtable, and a bounded qword/native-string map of the request
+// object so the real manager + request layout can be replayed.  Default
+// DISARMED => only a call counter increments.  The original submit is always
+// forwarded unchanged and its return value is preserved.
+typedef int64_t (__fastcall* AppMsgSubmit_t)(uint64_t a1, uint64_t a2,
+                                             uint64_t a3, uint64_t a4,
+                                             uint64_t a5);
+static AppMsgSubmit_t g_OriginalAppMsgSubmit = nullptr;
+static volatile LONG g_AppMsgSubmitHookState = 0;
+
+static void ObserveAppMsgSubmit(uint64_t a1, uint64_t a2, uint64_t a3,
+                                uint64_t a4, uint64_t a5)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AppMsgSubmitCalls));
+    // Passively persist the live network manager on EVERY submit, independent
+    // of the arm/capture gate below.  WeixinSend::SendAppMsg replays the
+    // sendappmsg CGI through this manager, so it must survive past the
+    // one-shot capture (session-stable for the lifetime of the login).
+    if (a1)
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_AppMsgSubmitManager),
+                              static_cast<LONG64>(a1));
+
+    // NOTE: earlier revisions cloned the first real SendAppMsgRequest into a
+    // persistent native template here (ctor + deep-copy into a non-arena heap
+    // buffer) so SendAppMsg could re-serialize it.  That native deep-copy was
+    // itself a crash suspect on the submit thread, and the current send path
+    // (WeixinSend::SendAppMsg -> custom-vtable CGI task) no longer needs a
+    // native template: it hand-serializes the protobuf request and only reuses
+    // the live network manager captured above.  The clone step is therefore
+    // removed; only the passive manager capture remains.
+
+    if (!g_AppMsgSubmitArmed || g_AppMsgSubmitCaptured)
+        return;
+
+    uintptr_t reqVtable = 0;
+    __try {
+        if (a2 && IsReadablePointer(reinterpret_cast<const void*>(a2)))
+            reqVtable = *reinterpret_cast<const uintptr_t*>(a2);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        reqVtable = 0;
+    }
+
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_AppMsgSubmitRequestObj),    static_cast<LONG64>(a2));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_AppMsgSubmitA3),            static_cast<LONG64>(a3));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_AppMsgSubmitA4),            static_cast<LONG64>(a4));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_AppMsgSubmitA5),            static_cast<LONG64>(a5));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_AppMsgSubmitRequestVtable), static_cast<LONG64>(reqVtable));
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(g_hWeixinDll);
+    char report[sizeof(g_AppMsgSubmitReport)]{};
+    int used = snprintf(report, sizeof(report),
+        "a1(mgr)=0x%llX a2(req)=0x%llX a3=0x%llX a4=0x%llX a5=0x%llX req_vtable_rva=0x%llX\n",
+        static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+        static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4),
+        static_cast<unsigned long long>(a5),
+        static_cast<unsigned long long>((reqVtable && reqVtable > base) ? (reqVtable - base) : 0));
+    if (used < 0)
+        used = 0;
+
+    // Structured request object: qword map + any embedded native strings
+    // (to_wxid / appmsg XML body land here as WeChat string members).
+    __try {
+        for (size_t off = 0; off <= 0x300 && used < static_cast<int>(sizeof(report)) - 160; off += 8) {
+            const void* fieldPtr = reinterpret_cast<const void*>(a2 + off);
+            if (!IsReadablePointer(fieldPtr))
+                break;
+            const uint64_t qw = *reinterpret_cast<const uint64_t*>(fieldPtr);
+            int w = snprintf(report + used, sizeof(report) - used,
+                             "req+0x%02zX = 0x%016llX", off,
+                             static_cast<unsigned long long>(qw));
+            if (w > 0)
+                used += (w < static_cast<int>(sizeof(report) - used))
+                    ? w : static_cast<int>(sizeof(report) - used - 1);
+
+            char value[4096]{};
+            uint64_t len = 0;
+            // Protobuf ArenaStringPtr: the field holds a pointer to the
+            // std::string struct, so dereference (qw) before reading.
+            if (ReadObservedWeixinString(qw, value, sizeof(value), &len) &&
+                len > 0) {
+                int w2 = snprintf(report + used, sizeof(report) - used,
+                                  "  <str len=%llu> %s",
+                                  static_cast<unsigned long long>(len), value);
+                if (w2 > 0)
+                    used += (w2 < static_cast<int>(sizeof(report) - used))
+                        ? w2 : static_cast<int>(sizeof(report) - used - 1);
+            }
+            if (used < static_cast<int>(sizeof(report)) - 2) {
+                report[used++] = '\n';
+                report[used] = 0;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+
+    // Recurse one level into the nested sub-messages: base (req+0x08) holds the
+    // routing wxids, appmsg (req+0x10) holds the card XML. Dump EVERY readable
+    // native string by content so we can identify to_wxid / appmsg XML offsets
+    // empirically instead of guessing protobuf field->offset semantics.
+    struct SubMsgProbe { size_t off; const char* label; size_t span; };
+    const SubMsgProbe subMsgs[2] = {
+        { 0x08, "base",   0x40 },
+        { 0x10, "appmsg", 0x78 },
+    };
+    for (size_t si = 0; si < 2 && used < static_cast<int>(sizeof(report)) - 256; ++si) {
+        __try {
+            const void* subPtrLoc = reinterpret_cast<const void*>(a2 + subMsgs[si].off);
+            if (!IsReadablePointer(subPtrLoc))
+                continue;
+            const uint64_t sub = *reinterpret_cast<const uint64_t*>(subPtrLoc);
+            if (!sub || !IsReadablePointer(reinterpret_cast<const void*>(sub)))
+                continue;
+            const uint64_t subVtable = *reinterpret_cast<const uint64_t*>(sub);
+            int wh = snprintf(report + used, sizeof(report) - used,
+                              "== %s @0x%llX vtable_rva=0x%llX ==\n",
+                              subMsgs[si].label, static_cast<unsigned long long>(sub),
+                              static_cast<unsigned long long>(
+                                  (subVtable > base) ? (subVtable - base) : 0));
+            if (wh > 0)
+                used += (wh < static_cast<int>(sizeof(report) - used))
+                    ? wh : static_cast<int>(sizeof(report) - used - 1);
+            for (size_t off = 0; off <= subMsgs[si].span &&
+                                 used < static_cast<int>(sizeof(report)) - 256; off += 8) {
+                const void* fieldPtr = reinterpret_cast<const void*>(sub + off);
+                if (!IsReadablePointer(fieldPtr))
+                    break;
+                const uint64_t qw = *reinterpret_cast<const uint64_t*>(fieldPtr);
+                int w = snprintf(report + used, sizeof(report) - used,
+                                 "%s+0x%02zX = 0x%016llX", subMsgs[si].label, off,
+                                 static_cast<unsigned long long>(qw));
+                if (w > 0)
+                    used += (w < static_cast<int>(sizeof(report) - used))
+                        ? w : static_cast<int>(sizeof(report) - used - 1);
+
+                char value[8192]{};
+                uint64_t len = 0;
+                // ArenaStringPtr indirection: read the string via the pointer (qw).
+                if (ReadObservedWeixinString(qw, value, sizeof(value), &len) &&
+                    len > 0 && len < sizeof(value)) {
+                    int w2 = snprintf(report + used, sizeof(report) - used,
+                                      "  <str len=%llu> %s",
+                                      static_cast<unsigned long long>(len), value);
+                    if (w2 > 0)
+                        used += (w2 < static_cast<int>(sizeof(report) - used))
+                            ? w2 : static_cast<int>(sizeof(report) - used - 1);
+                }
+                if (used < static_cast<int>(sizeof(report)) - 2) {
+                    report[used++] = '\n';
+                    report[used] = 0;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+
+    CopySafeText(report, g_AppMsgSubmitReport, sizeof(g_AppMsgSubmitReport));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_AppMsgSubmitCaptured), 1);
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_AppMsgSubmitArmed), 0);
+}
+
+static int64_t __fastcall Hook_AppMsgSubmit(uint64_t a1, uint64_t a2, uint64_t a3,
+                                            uint64_t a4, uint64_t a5)
+{
+    ObserveAppMsgSubmit(a1, a2, a3, a4, a5);
+    return g_OriginalAppMsgSubmit
+        ? g_OriginalAppMsgSubmit(a1, a2, a3, a4, a5) : 0;
+}
+
+static void InstallAppMsgSubmitObserverHook()
+{
+    if (InterlockedCompareExchange(&g_AppMsgSubmitHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x36AF120);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_AppMsgSubmit),
+                      reinterpret_cast<void**>(&g_OriginalAppMsgSubmit)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK)
+    {
+        g_OriginalAppMsgSubmit = nullptr;
+        InterlockedExchange(&g_AppMsgSubmitHookState, 0);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_AppMsgSubmitHookInstalled), 0);
+    }
+    else
+    {
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_AppMsgSubmitHookInstalled), 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generic CGI task-dispatch observer (read-only, passive manager capture).
+//
+// sub_7FFE8EC64F80 (Weixin.dll+0x304F80) is the network manager's concrete
+// task-dispatch method: it is manager->vtable[5] (F120 dispatches via
+// (*(*(a1)+40))(a1, task)).  EVERY CGI task -- login, contact sync, message
+// sync, sendappmsg -- is dispatched through it with signature (manager, task):
+// it generates a task id into task+8 and inserts the task into the manager's
+// pending-task tree at manager+72.  We passively persist the live network
+// manager (a1) on the FIRST call so WeixinSend::SendAppMsg can replay a
+// sendappmsg CGI immediately after login, without waiting for the user to send
+// a card by hand (the sendappmsg-specific F120 observer only fires when a card
+// is actually sent).  The original dispatch is always forwarded unchanged and
+// its return value preserved.
+typedef int64_t (__fastcall* TaskDispatch_t)(uint64_t a1, uint64_t a2);
+static TaskDispatch_t g_OriginalTaskDispatch = nullptr;
+static volatile LONG g_TaskDispatchHookState = 0;
+
+static int64_t __fastcall Hook_TaskDispatch(uint64_t a1, uint64_t a2)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_TaskDispatchCalls));
+    if (a1 && !g_AppMsgSubmitManager)
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_AppMsgSubmitManager),
+                              static_cast<LONG64>(a1));
+    return g_OriginalTaskDispatch
+        ? g_OriginalTaskDispatch(a1, a2) : 0;
+}
+
+static void InstallTaskDispatchObserverHook()
+{
+    if (InterlockedCompareExchange(&g_TaskDispatchHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x304F80);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_TaskDispatch),
+                      reinterpret_cast<void**>(&g_OriginalTaskDispatch)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK)
+    {
+        g_OriginalTaskDispatch = nullptr;
+        InterlockedExchange(&g_TaskDispatchHookState, 0);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_TaskDispatchHookInstalled), 0);
+    }
+    else
+    {
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_TaskDispatchHookInstalled), 1);
+    }
+}
+
 static bool IsUsefulMessageText(const char* s)
 {
     if (!s || !*s)
@@ -2533,6 +3162,7 @@ struct AutoReplyTask {
     std::string content;
     bool is_group = false;
     std::string sender_wxid;
+    std::string reply;   // final rendered reply text from the rules engine
 };
 
 static std::mutex g_AutoReplyMutex;
@@ -2562,6 +3192,49 @@ static bool IsSelfWxid(const std::string& value)
     return g_SyncBatchToUsername[0] && value == g_SyncBatchToUsername;
 }
 
+// A chatroom text item stores the actual body as "<member wxid>:\n<body>".
+// Split that into the member wxid and the stripped body.  When the prefix is
+// missing (system notices, some app messages) member stays empty and the body
+// is returned unchanged.  Only validated, already-copied strings are parsed.
+static void SplitGroupContent(const std::string& content,
+                              std::string& memberOut, std::string& bodyOut)
+{
+    memberOut.clear();
+    bodyOut = content;
+    const size_t nl = content.find('\n');
+    if (nl == std::string::npos || nl == 0 || nl > 128)
+        return;
+    if (content[nl - 1] != ':')
+        return;
+    const std::string prefix = content.substr(0, nl - 1);
+    if (prefix.empty() || prefix.find(':') != std::string::npos)
+        return;
+    if (!IsLikelyWxid(prefix))
+        return;
+    memberOut = prefix;
+    bodyOut = content.substr(nl + 1);
+}
+
+// Map the raw micromsg.AddMsg type field to the callback-friendly name used by
+// external services.  Unknown values fall back to "other" while still posting
+// the numeric type.
+static const char* MsgTypeName(uint32_t type)
+{
+    switch (type) {
+    case 1:     return "text";
+    case 3:     return "image";
+    case 34:    return "voice";
+    case 42:    return "card";
+    case 43:    return "video";
+    case 47:    return "emoji";
+    case 48:    return "location";
+    case 49:    return "app";      // file / quote / link / miniprogram
+    case 10000: return "system";
+    case 10002: return "recall";
+    default:    return "other";
+    }
+}
+
 static void RecordAutoReplyClassification(const char* type,
                                           const std::string& sender,
                                           const std::string& room)
@@ -2589,11 +3262,10 @@ static void StartAutoReplyWorker()
                 // Let WeChat finish its receive/commit path before entering
                 // the send routine on a separate thread.
                 Sleep(300);
-                if (g_IsLogin && !task.wxid.empty() && !task.content.empty()) {
-                    // Keep the generated prefix ASCII-only so the injected
-                    // DLL does not depend on the source-file code page.
-                    const std::string reply = "[auto-reply] " + task.content;
-                    if (WeixinSend::SendText(task.wxid, reply))
+                if (g_IsLogin && !task.wxid.empty() && !task.reply.empty()) {
+                    // The reply text was already rendered by the rules engine
+                    // (AutoReply::BuildReply) at classification time.
+                    if (WeixinSend::SendText(task.wxid, task.reply))
                         InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplySent));
                     else
                         InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyFailed));
@@ -2604,10 +3276,11 @@ static void StartAutoReplyWorker()
 }
 
 static void QueueAutoReplyDirect(const std::string& wxid, const std::string& content,
+                                 const std::string& reply,
                                  bool isGroup = false,
                                  const std::string& senderWxid = {})
 {
-    if (!g_IsLogin || !IsLikelyWxid(wxid) || content.empty() || wxid == SelfInfo.wxid)
+    if (!g_IsLogin || !IsLikelyWxid(wxid) || reply.empty() || wxid == SelfInfo.wxid)
         return;
     const std::string key = wxid + "\n" + content;
     {
@@ -2617,17 +3290,18 @@ static void QueueAutoReplyDirect(const std::string& wxid, const std::string& con
         g_AutoReplyLastKey = key;
         if (g_AutoReplyQueue.size() >= 32)
             g_AutoReplyQueue.pop_front();
-        g_AutoReplyQueue.push_back({wxid, content, isGroup, senderWxid});
+        g_AutoReplyQueue.push_back({wxid, content, isGroup, senderWxid, reply});
     }
     StartAutoReplyWorker();
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyQueued));
     g_AutoReplyCv.notify_one();
 }
 
-// Classify incoming messages before they can reach the send worker.  In this
-// build friend replies are enabled; group replies are recognized but disabled
-// by default to prevent accidental group-wide spam.  The group switch is
-// exposed in status so it can be explicitly enabled later.
+// Classify incoming messages before they can reach the send worker.  The
+// friend/group master switches, black/white lists, keyword rules and reply
+// templates are all driven by the persisted AutoReply config; the receive Hook
+// never sends directly.  Group replies stay off by default (config default),
+// preventing accidental group-wide spam.
 static void ClassifyAndQueueAutoReply(const std::string& fromWxid,
                                       const std::string& toWxid,
                                       const std::string& content)
@@ -2639,26 +3313,38 @@ static void ClassifyAndQueueAutoReply(const std::string& fromWxid,
         RecordAutoReplyClassification("self", fromWxid, {});
         return;
     }
+
     if (IsGroupWxid(fromWxid)) {
         InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyGroupCandidates));
-        RecordAutoReplyClassification("group", fromWxid, fromWxid);
-        if (!g_AutoReplyGroupEnabled) {
+        // Group text arrives as "<member wxid>:\n<body>"; split so {sender}
+        // is the member and {content} is the stripped body.  The reply target
+        // stays the room (fromWxid) so the answer lands back in the group.
+        std::string member, body;
+        SplitGroupContent(content, member, body);
+        const std::string& senderWxid = member.empty() ? fromWxid : member;
+        RecordAutoReplyClassification("group", senderWxid, fromWxid);
+        std::string reply;
+        if (!AutoReply::BuildReply(true, senderWxid, fromWxid, body, reply)) {
             InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyGroupSkipped));
             return;
         }
         InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyCandidates));
-        QueueAutoReplyDirect(fromWxid, content, true, {});
+        QueueAutoReplyDirect(fromWxid, body, reply, true, senderWxid);
         return;
     }
+
     if (!IsLikelyWxid(fromWxid))
         return;
     // A normal friend message uses the sender as the reply target.  The
     // destination is retained for diagnostics; it must not replace sender.
     (void)toWxid;
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyFriendCandidates));
-    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyCandidates));
     RecordAutoReplyClassification("friend", fromWxid, {});
-    QueueAutoReplyDirect(fromWxid, content, false, fromWxid);
+    std::string reply;
+    if (!AutoReply::BuildReply(false, fromWxid, {}, content, reply))
+        return;
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AutoReplyCandidates));
+    QueueAutoReplyDirect(fromWxid, content, reply, false, fromWxid);
 }
 
 static void QueueAutoReply(const std::string& wxid, const std::string& content)
@@ -2866,11 +3552,67 @@ static bool CopyValidatedAddMsgString(int64_t item, size_t fieldOffset,
     }
 }
 
+static bool ReadValidatedAddMsgUInt32(int64_t item, size_t fieldOffset,
+                                      uint32_t hasBit, uint32_t& value)
+{
+    value = 0;
+    if (!item || !g_hWeixinDll)
+        return false;
+    __try {
+        const uint32_t hasBits = *reinterpret_cast<const uint32_t*>(item + 0x6C);
+        if ((hasBits & hasBit) == 0)
+            return false;
+        value = *reinterpret_cast<const uint32_t*>(item + fieldOffset);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        value = 0;
+        return false;
+    }
+}
+
+// Push one validated AddMsg item to the external webhook (wx.ini recv_url).
+// This runs from the read-only SyncBatch capture path whose vtable/has-bits/
+// string layout are all verified, so it never touches the unverified message
+// getters used by the legacy dispatch Hook.  Payload keeps the existing
+// cmdId/msglist envelope and adds toid, real msgtype, room and group sender.
+static void PostValidatedReceivedMessage(const std::string& from,
+                                         const std::string& to,
+                                         const std::string& content,
+                                         uint32_t msgType,
+                                         const std::string& room,
+                                         const std::string& sender)
+{
+    if (g_CallBack_Url.empty() || from.empty())
+        return;
+    json item;
+    item["cmdId"] = 5;
+    item["msgtype"] = msgType;
+    item["msgtypename"] = MsgTypeName(msgType);
+    item["fromid"] = from;
+    item["toid"] = to;
+    item["room"] = room;      // @chatroom id for group messages, empty otherwise
+    item["sender"] = sender;  // group member wxid, or the friend wxid
+    item["msg"] = content;
+    item["msgsvrid"] = 0;
+    item["time"] = static_cast<uint64_t>(GetTickCount64());
+
+    json payload;
+    payload["ServerPort"] = g_StartPort;
+    payload["msgnumber"] = 1;
+    payload["sendorrecv"] = 2;
+    payload["selfwxid"] = SelfInfo.wxid;
+    payload["msglist"] = json::array({item});
+    HttpPostJsonAsync(g_CallBack_Url, payload.dump());
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_MessageCallbackPosts));
+}
+
 struct AddMsgCapture {
     bool captured = false;
     bool gotFrom = false;
     bool gotTo = false;
     bool gotContent = false;
+    bool gotMsgType = false;
+    uint32_t msgType = 0;
     char from[4096]{};
     char to[4096]{};
     char content[4096]{};
@@ -2892,9 +3634,12 @@ static bool CaptureValidatedAddMsgItemRaw(int64_t item, AddMsgCapture& capture)
         InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SyncBatchLastCandidate),
                               static_cast<LONG64>(item));
 
-        const uint32_t msgType = *reinterpret_cast<const uint32_t*>(item + 0x10);
+        // micromsg.AddMsg field 4 is msgtype: uint32 at item+0x14,
+        // guarded by has-bit 0x08.  Field 1 at item+0x10 is not msgtype.
+        capture.gotMsgType =
+            ReadValidatedAddMsgUInt32(item, 0x14, 0x08, capture.msgType);
         InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_SyncBatchLastMsgType),
-                              static_cast<LONG64>(msgType));
+                              static_cast<LONG64>(capture.msgType));
 
         capture.gotFrom = CopyValidatedAddMsgString(item, 0x08, 0x02,
                                                      capture.from, sizeof(capture.from));
@@ -2928,7 +3673,27 @@ static bool CaptureValidatedAddMsgItem(int64_t item)
         const std::string fromValue(capture.from);
         const std::string toValue(capture.gotTo ? capture.to : "");
         const std::string contentValue(capture.content);
-        ClassifyAndQueueAutoReply(fromValue, toValue, contentValue);
+
+        // Derive room/sender for the webhook: group messages carry the
+        // "<member>:\n<body>" prefix, single-friend messages do not.
+        std::string room;
+        std::string sender;
+        if (IsGroupWxid(fromValue)) {
+            room = fromValue;
+            std::string member, body;
+            SplitGroupContent(contentValue, member, body);
+            sender = member.empty() ? fromValue : member;
+        } else {
+            sender = fromValue;
+        }
+
+        // Structured receive fan-out for every message type (text/image/voice/
+        // video/file/quote/system) goes to the external service; auto-reply is
+        // still gated by the rules engine and only meaningful for text.
+        PostValidatedReceivedMessage(fromValue, toValue, contentValue,
+                                     capture.msgType, room, sender);
+        if (capture.gotMsgType && capture.msgType == 1)
+            ClassifyAndQueueAutoReply(fromValue, toValue, contentValue);
     }
     return true;
 }
@@ -4443,6 +5208,10 @@ void Evt_WeixinLoad()
         g_httpServer->Start("0.0.0.0", g_StartPort);
     }
 
+    // Load the persisted auto-reply rules/config (autoreply.json next to the
+    // host executable).  Falls back to safe defaults (global switch off).
+    AutoReply::LoadFromDisk();
+
     InstallLoginStateProbeHook();
     InstallLoginFinishHook();
     // Re-enable only profile observation for the current isolation pass.
@@ -4462,6 +5231,13 @@ void Evt_WeixinLoad()
     // when another code path invokes the copy/serialization helper.
     InstallSendMsgRequestObserverHook();
     InstallSendMsgElementObserverHook();
+    InstallUnifiedSendMessageObserverHook();
+    InstallForwardSourceObserverHook();
+    InstallAppMsgSubmitObserverHook();
+    // Passive network-manager capture on the generic CGI dispatcher: fires on
+    // any network action after login, so SendAppMsg has a live manager without
+    // requiring a manual card send to hit the sendappmsg-specific F120 path.
+    InstallTaskDispatchObserverHook();
     // Read-only contact response parser observation.  This populates the
     // bounded contact cache from WeChat's own response objects, so /GetContact
     // does not need to wake or access an idle SQLite connection.

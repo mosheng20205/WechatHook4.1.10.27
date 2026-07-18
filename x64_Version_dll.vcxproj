@@ -173,6 +173,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="framework.h" />
+    <ClInclude Include="include\auto_reply.h" />
     <ClInclude Include="include\ForwardXMLMsg.h" />
     <ClInclude Include="include\GetSelfProfile.h" />
     <ClInclude Include="include\global.h" />
@@ -207,6 +208,7 @@
     <ClCompile Include="minhook\src\hde\hde64.c" />
     <ClCompile Include="minhook\src\hook.c" />
     <ClCompile Include="minhook\src\trampoline.c" />
+    <ClCompile Include="src\auto_reply.cpp" />
     <ClCompile Include="src\ForwardXMLMsg.cpp" />
     <ClCompile Include="src\GetSelfProfile.cpp" />
     <ClCompile Include="src\HookManager.cpp" />

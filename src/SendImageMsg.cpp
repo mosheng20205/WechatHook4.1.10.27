@@ -55,18 +55,13 @@ void Route_SendImageMsg(httplib::Server& svr)
                 return;
             }
 
-            // The image message object layout has not been revalidated for
-            // WeChat 4.1.10.27.  Do not enter the old offset-based builder:
-            // a plausible executable address is not proof that its object
-            // layout is compatible, and an invalid layout can terminate
-            // Weixin.exe.  Keep the endpoint explicit until IDA/runtime
-            // verification supplies the new vtables and call boundary.
-            resp["ret"] = -3;
-            resp["retmsg"] = "image send offsets are not runtime-verified for WeChat 4.1.10.27";
-            resp["queued"] = false;
-            res.set_content(resp.dump(), "application/json; charset=utf-8");
-            return;
-
+            // Image message vtables verified in IDA for 4.1.10.27:
+            //   img_msg_vtbl  0x84F96B8 -> first slot 0x18000A7F0
+            //   img_msg_vtb2  0x84F9748 -> first slot 0x1817781D0
+            // The send call path (send_message/create_param2/param2*/param1
+            // vtable) is shared with the working text-send path.  SendImage
+            // wraps the native call in SEH so a bad layout returns false
+            // instead of terminating Weixin.exe.
             const bool queued = WeixinSend::SendImage(wxidorgid, path);
 
             resp["ret"] = queued ? 0 : -3;

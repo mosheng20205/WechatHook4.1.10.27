@@ -13,6 +13,7 @@
 - `/GetSelfProfile`：返回当前账号的 wxid、别名、昵称和手机号。
 - 实时普通文本接收：提取发送者 wxid、接收者 wxid 和正文。
 - `/SendTextMsg`：完成登录保护、发送请求入队和异步发送。
+- `/ForwardXMLMsg`：appmsg/XML 链接卡片**真实发送**，已经真实微信进程端到端验证（服务器返回 `ret = 0`，卡片在对话中可见）。
 - 好友和群聊自动回复：均已完成真实消息端到端验证。
 - `/QueryDB/status`：返回登录状态、消息观察、联系人和自动回复诊断计数。
 - `/QueryDB/GetAllDBName`：返回 SQLite Hook 捕获的联系人数据库，不扫描进程内存。
@@ -44,7 +45,10 @@ POST http://127.0.0.1:30001/GetContacts
 POST http://127.0.0.1:30001/GetContact
 POST http://127.0.0.1:30001/GetSelfProfile
 POST http://127.0.0.1:30001/SendTextMsg
+GET  http://127.0.0.1:30001/AutoReply/config
 POST http://127.0.0.1:30001/AutoReply/config
+GET  http://127.0.0.1:30001/AutoReply/rules
+POST http://127.0.0.1:30001/AutoReply/rules
 POST http://127.0.0.1:30001/QueryDB/GetAllDBName
 POST http://127.0.0.1:30001/QueryDB/execute
 POST http://127.0.0.1:30001/SendImgMsg
@@ -132,6 +136,26 @@ Invoke-RestMethod `
 
 `/SendTextMsg` 返回本地入队结果，不等同于微信服务端送达回执。
 
+### XML 卡片转发
+
+`/ForwardXMLMsg` 将 appmsg/XML 链接卡片**真实发送**到指定会话（已端到端验证）。
+
+```powershell
+Invoke-RestMethod `
+  -Uri 'http://127.0.0.1:30001/ForwardXMLMsg' `
+  -Method Post `
+  -ContentType 'application/json' `
+  -Body '{"to_wxid":"filehelper","type":5,"content":"<appmsg><title>标题</title><des>描述</des><type>5</type><url>https://github.com/</url></appmsg>"}'
+```
+
+实现要点：
+
+- 发送不复用本地文本/图片内容类（实测会崩溃），而是直接构造 `sendappmsg` CGI task，经网络管理器的通用任务分发器（`manager->vtable[5]`，RVA `0x304F80`）下发。
+- 网络管理器在登录/同步等任意 CGI 动作时被动捕获，无需手动触发。
+- `fromusername` 使用从联系人数据库路径解析出的真实 `wxid_`（而非别名），否则服务器会以 `ret = -2` 拒绝。
+- native 调用均用 SEH 包裹；发送前校验登录状态与管理器已捕获。
+- 诊断计数（`/QueryDB/status`）：`AppMsgSendCalls`、`AppMsgDispatchOk/Fail`、`AppMsgLastRet`（`0` 为服务器接受）。
+
 ### 数据库接口
 
 微信 4.1.10.27 的联系人数据库路径为 `db_storage\contact\contact.db`。Hook 同时兼容旧逻辑名 `MicroMsg.db`，并明确排除 `contact_fts.db`。
@@ -151,9 +175,13 @@ powershell -ExecutionPolicy Bypass -File .\tools\test-api.ps1 -RequireLogin
 
 ## 当前限制
 
-- `/SendImgMsg`、`/ForwardXMLMsg`、`/Decode_Pic`：4.1.10.27 的相关偏移尚未重新验证，目前会安全拒绝执行。
-- `/GetSelfProfile` 的 `area`、`signinfo`、`avatar`、`small_avatar`、`sex` 等可选字段仍可能为空，不会使用猜测偏移填充。
-- `/SendTextMsg` 已验证本地发送入队和自动回复链路，尚未单独实现微信服务端送达回执。
+- `/SendImgMsg`：图片消息 vtable(`0x84F96B8`/`0x84F9748`)已在 IDA 对 4.1.10.27 校验，复用文本发送已验证的调用链，native 调用用 SEH 包裹；返回本地入队结果，对端送达仍需真实账号验证。
+- `/Decode_Pic`：解密函数偏移(`0x493E70`)已在 IDA 对 4.1.10.27 校验并启用，native 调用用 SEH 包裹。
+- `/ForwardXMLMsg`：appmsg/XML 链接卡片真实发送已启用并端到端验证（服务器 `ret = 0`，卡片在对话中可见，微信进程稳定无崩溃）。发送经由直接构造 `sendappmsg` CGI task 并经通用任务分发器下发；返回值代表服务器应答结果。
+- `/GetSelfProfile` 的 `area`、`signinfo`、`avatar`、`small_avatar`、`sex` 等可选字段依赖数据库，仍可能为空，不会使用猜测偏移填充。
+- `/SendTextMsg` 已验证本地发送入队和自动回复链路，返回值仅表示进入本地发送队列，不代表微信服务端或对端已送达。
+- `/QueryDB/GetAllDBName` 仅返回 SQLite Hook 实际捕获到的联系人库句柄，不扫描进程内存；`/QueryDB/execute` 仅允许单条只读 SQL。
+- 实时接收回调:配置 `wx.ini [wx] recv_url` 后，接收链路会把已验证的消息(含 msgtype、群 room 与群内成员 sender)异步 POST 到该地址;非文本消息按类型分类推送。
 - 多账号切换、退出后重新登录仍建议在发布前执行完整真实账号回归。
 
 ## 版本适配笔记

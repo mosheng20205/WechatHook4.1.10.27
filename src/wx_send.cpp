@@ -3,6 +3,7 @@
 #include <string>
 #include <cstddef>
 #include <cstring>
+#include <ctime>
 #include <objbase.h>
 #include "global.h"
 #include "tools.h"
@@ -412,12 +413,18 @@ namespace WeixinSend
         if (!paramStruct)
             return false;
 
-        BuildSendParam2_Image(paramStruct);
-
         WeixinCall send_message = (WeixinCall)(WeixinDLL_baseAddr + offset::send_message);
         if (!send_message)
             return false;
-        send_message((uint64_t)struct2, (uint64_t)paramStruct);
+        // Guard the native construction/send: a layout mismatch faults inside
+        // Weixin rather than corrupting the caller, so translate any access
+        // violation into a false result instead of terminating the host.
+        __try {
+            BuildSendParam2_Image(paramStruct);
+            send_message((uint64_t)struct2, (uint64_t)paramStruct);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
         return true;
     }
 
@@ -543,9 +550,499 @@ namespace WeixinSend
         SetWeixinString((WeixinString*)(arg2), dec_pic_path);
 
 
-        WeixinCall Decode_Pic = (WeixinCall)(base + offset::dec_pic_call);
-        Decode_Pic((uint64_t)arg1, (uint64_t)arg2, 1);
-        return true;
+        using DecodePicCall = int64_t(__fastcall*)(uint64_t, uint64_t, uint32_t);
+        DecodePicCall decodePic =
+            reinterpret_cast<DecodePicCall>(base + offset::dec_pic_call);
+        int64_t nativeResult = 0;
+        __try {
+            nativeResult = decodePic((uint64_t)arg1, (uint64_t)arg2, 1);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+        // Weixin's caller tests the low byte of sub_180493E70's return value.
+        return static_cast<uint8_t>(nativeResult) != 0;
+    }
+
+    // ==================================================================
+    // appmsg / XML (msgtype 49) REAL send via a CUSTOM-VTABLE CGI task
+    // (WeChat 4.1.10.27).
+    //
+    // Earlier attempts handed WeChat a NATIVE SendAppMsgRequest protobuf object
+    // (from-scratch or template-cloned) and let the async network worker
+    // serialize it; both crashed in the worker at Weixin.dll+0x46a92e3 while
+    // serializing that native object (any ArenaStringPtr / has-bit / arena
+    // mismatch is fatal there and outside SEH reach).  This path NEVER hands
+    // WeChat a native object to serialize.
+    //
+    // We build the sendappmsg CGI task exactly like the native submit primitive
+    // (offset::appmsg_task_ctor = sub_7FFE9200F460: cgi type 222, endpoint
+    // "/cgi-bin/micromsg-bin/sendappmsg", empty inner request @task+240), then
+    // OVERRIDE the task's 6-slot vtable so:
+    //   [0] dtor      -> no-op (task intentionally leaked: avoids cross-
+    //                   allocator free + destruct of the never-populated
+    //                   response object @task+336)
+    //   [1] serialize -> emit our OWN hand-serialized protobuf bytes into the
+    //                   output holder (native inner-req serialize, the crash
+    //                   path, is never called)
+    //   [2] response  -> capture the reply bytes + parse BaseResponse.ret
+    //   [3] getinner  -> return task+240 (native semantics)
+    //   [4] dummy / [5] literal 1 (native semantics)
+    // task+208 is pointed at a dummy-vtable callback holder so the framework's
+    // response-notify path has a valid (harmless) object.  The task is
+    // dispatched directly through the live network manager
+    // (g_AppMsgSubmitManager, captured passively at the F120 observer) via
+    // manager->vtable[5] -- identical to what F120 does.
+    //
+    // protobuf wire format (schema-version independent, mirrors the working
+    // reference project):
+    //   AppMsg:        1=from(str) 3=0(varint) 4=to(str) 5=type(varint)
+    //                  6=xml(str) 7=timestamp(varint) 8=clientmsgid(str)
+    //                  12=msgsource(str)
+    //   BaseRequest:   1="" 2=0 3="Windows" 4=0 5="Windows" 6=0
+    //   SendAppMsgReq: 1=BaseRequest(bytes) 2=AppMsg(bytes)
+    // ==================================================================
+
+    // ---- pending registry (POD only: safe to touch inside SEH-guarded,
+    //      worker-thread vtable callbacks) --------------------------------
+    struct AppMsgPending
+    {
+        volatile LONG64 taskPtr;   // key (0 = free slot)
+        const uint8_t*  reqData;   // leaked pre-serialized request bytes
+        uint32_t        reqSize;
+        HANDLE          evt;       // manual-reset, signaled by response cb (leaked)
+        volatile LONG   done;
+        int             ret;       // parsed BaseResponse.ret
+    };
+    static AppMsgPending    g_appmsgPending[16] = {};
+    static CRITICAL_SECTION g_appmsgCs;
+    static volatile LONG    g_appmsgCsState = 0;
+
+    static void AppMsgEnsureCs()
+    {
+        if (InterlockedCompareExchange(&g_appmsgCsState, 1, 0) == 0) {
+            InitializeCriticalSection(&g_appmsgCs);
+            InterlockedExchange(&g_appmsgCsState, 2);
+        }
+        while (g_appmsgCsState != 2)
+            Sleep(0);
+    }
+
+    static void AppMsgRegister(uint64_t taskPtr, const uint8_t* data,
+                               uint32_t size, HANDLE evt)
+    {
+        AppMsgEnsureCs();
+        EnterCriticalSection(&g_appmsgCs);
+        for (int i = 0; i < 16; ++i) {
+            if (g_appmsgPending[i].taskPtr == 0) {
+                g_appmsgPending[i].reqData = data;
+                g_appmsgPending[i].reqSize = size;
+                g_appmsgPending[i].evt     = evt;
+                g_appmsgPending[i].done    = 0;
+                g_appmsgPending[i].ret     = 0;
+                InterlockedExchange64(&g_appmsgPending[i].taskPtr,
+                                      static_cast<LONG64>(taskPtr));
+                break;
+            }
+        }
+        LeaveCriticalSection(&g_appmsgCs);
+    }
+
+    static void AppMsgUnregister(uint64_t taskPtr, LONG* outDone, int* outRet)
+    {
+        AppMsgEnsureCs();
+        EnterCriticalSection(&g_appmsgCs);
+        for (int i = 0; i < 16; ++i) {
+            if (static_cast<uint64_t>(g_appmsgPending[i].taskPtr) == taskPtr) {
+                if (outDone) *outDone = g_appmsgPending[i].done;
+                if (outRet)  *outRet  = g_appmsgPending[i].ret;
+                // Leak evt (do NOT close): the async worker may still touch it.
+                InterlockedExchange64(&g_appmsgPending[i].taskPtr, 0);
+                g_appmsgPending[i].reqData = nullptr;
+                g_appmsgPending[i].reqSize = 0;
+                g_appmsgPending[i].evt     = nullptr;
+                break;
+            }
+        }
+        LeaveCriticalSection(&g_appmsgCs);
+    }
+
+    // ---- protobuf serialize helpers (std::string; only ever called from
+    //      SendAppMsg, never from the SEH-guarded worker callbacks) --------
+    static void PbVarint(std::string& out, uint64_t v)
+    {
+        while (v >= 0x80) { out.push_back(static_cast<char>((v & 0x7F) | 0x80)); v >>= 7; }
+        out.push_back(static_cast<char>(v));
+    }
+    static void PbTag(std::string& out, uint32_t field, uint32_t wire)
+    {
+        PbVarint(out, (static_cast<uint64_t>(field) << 3) | wire);
+    }
+    static void PbVarintField(std::string& out, uint32_t field, uint64_t v)
+    {
+        PbTag(out, field, 0); PbVarint(out, v);
+    }
+    static void PbBytesField(std::string& out, uint32_t field, const char* d, size_t n)
+    {
+        PbTag(out, field, 2); PbVarint(out, n); out.append(d, n);
+    }
+    static void PbStringField(std::string& out, uint32_t field, const std::string& s)
+    {
+        PbBytesField(out, field, s.data(), s.size());
+    }
+
+    static std::string BuildBaseRequest()
+    {
+        std::string m;
+        static const char dev[] = "Windows";
+        PbBytesField(m, 1, "", 0);
+        PbVarintField(m, 2, 0);
+        PbBytesField(m, 3, dev, sizeof(dev) - 1);
+        PbVarintField(m, 4, 0);
+        PbBytesField(m, 5, dev, sizeof(dev) - 1);
+        PbVarintField(m, 6, 0);
+        return m;
+    }
+    static std::string BuildAppMsg(const std::string& from, const std::string& to,
+                                   const std::string& xml, uint32_t type,
+                                   const std::string& cmid)
+    {
+        std::string m;
+        PbStringField(m, 1, from);
+        PbVarintField(m, 3, 0);
+        PbStringField(m, 4, to);
+        PbVarintField(m, 5, type);
+        PbStringField(m, 6, xml);
+        PbVarintField(m, 7, static_cast<uint32_t>(::time(nullptr)));
+        PbStringField(m, 8, cmid);
+        PbStringField(m, 12, "<msgsource><bizflag>0</bizflag></msgsource>");
+        return m;
+    }
+    static std::string BuildSendAppMsgReq(const std::string& from, const std::string& to,
+                                          const std::string& xml, uint32_t type,
+                                          const std::string& cmid)
+    {
+        std::string base   = BuildBaseRequest();
+        std::string appmsg = BuildAppMsg(from, to, xml, type, cmid);
+        std::string out;
+        PbBytesField(out, 1, base.data(), base.size());
+        PbBytesField(out, 2, appmsg.data(), appmsg.size());
+        return out;
+    }
+
+    // ---- POD protobuf response parsers (usable inside __try) -------------
+    static bool PbReadVarint(const uint8_t* d, uint32_t n, uint32_t* pos, uint64_t* val)
+    {
+        uint64_t r = 0; int sh = 0;
+        while (*pos < n && sh <= 63) {
+            uint8_t b = d[(*pos)++];
+            r |= static_cast<uint64_t>(b & 0x7F) << sh;
+            if (!(b & 0x80)) { *val = r; return true; }
+            sh += 7;
+        }
+        return false;
+    }
+    static int ParseBaseResponseRet(const uint8_t* d, uint32_t n)
+    {
+        uint32_t pos = 0;
+        while (pos < n) {
+            uint64_t tag = 0;
+            if (!PbReadVarint(d, n, &pos, &tag)) return 0;
+            uint32_t f = static_cast<uint32_t>(tag >> 3), w = static_cast<uint32_t>(tag & 7);
+            if (w == 0) { uint64_t v = 0; if (!PbReadVarint(d, n, &pos, &v)) return 0; if (f == 1) return static_cast<int>(v); }
+            else if (w == 2) { uint64_t l = 0; if (!PbReadVarint(d, n, &pos, &l) || pos + l > n) return 0; pos += static_cast<uint32_t>(l); }
+            else if (w == 1) { if (pos + 8 > n) return 0; pos += 8; }
+            else if (w == 5) { if (pos + 4 > n) return 0; pos += 4; }
+            else return 0;
+        }
+        return 0;
+    }
+    static int ParseSendAppMsgRet(const uint8_t* d, uint32_t n)
+    {
+        uint32_t pos = 0;
+        while (pos < n) {
+            uint64_t tag = 0;
+            if (!PbReadVarint(d, n, &pos, &tag)) break;
+            uint32_t f = static_cast<uint32_t>(tag >> 3), w = static_cast<uint32_t>(tag & 7);
+            if (w == 0) { uint64_t v = 0; if (!PbReadVarint(d, n, &pos, &v)) break; }
+            else if (w == 2) { uint64_t l = 0; if (!PbReadVarint(d, n, &pos, &l) || pos + l > n) break; if (f == 1) return ParseBaseResponseRet(d + pos, static_cast<uint32_t>(l)); pos += static_cast<uint32_t>(l); }
+            else if (w == 1) { if (pos + 8 > n) break; pos += 8; }
+            else if (w == 5) { if (pos + 4 > n) break; pos += 4; }
+            else break;
+        }
+        return 0;
+    }
+
+    // ---- custom task vtable slots (POD, __fastcall; run on WeChat's network
+    //      worker thread => SEH-guarded, no C++ objects needing unwinding) --
+    static __int64 __fastcall MyAppMsgDtor(uint64_t self, __int64, __int64)
+    {
+        return static_cast<__int64>(self);   // no-op: task intentionally leaked
+    }
+    static __int64 __fastcall MyAppMsgGetInner(uint64_t self)
+    {
+        return static_cast<__int64>(self + 240);
+    }
+    static __int64 __fastcall MyAppMsgDummy(uint64_t, __int64, __int64, __int64)
+    {
+        return 1;
+    }
+    static char __fastcall MyAppMsgSerialize(uint64_t self, uint64_t holder,
+                                             uint64_t /*a3*/, uint8_t* a4, uint64_t /*a5*/)
+    {
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AppMsgSerializeCalls));
+        __try {
+            if (a4) *a4 = 1;   // BaseRequest is embedded in our bytes => report OK
+            const uint8_t* data = nullptr; uint32_t size = 0;
+            AppMsgEnsureCs();
+            EnterCriticalSection(&g_appmsgCs);
+            for (int i = 0; i < 16; ++i) {
+                if (static_cast<uint64_t>(g_appmsgPending[i].taskPtr) == self) {
+                    data = g_appmsgPending[i].reqData;
+                    size = g_appmsgPending[i].reqSize;
+                    break;
+                }
+            }
+            LeaveCriticalSection(&g_appmsgCs);
+            if (data && size && holder) {
+                using HolderWrite_t = __int64(__fastcall*)(uint64_t, uint64_t, uint32_t);
+                HolderWrite_t hw = reinterpret_cast<HolderWrite_t>(
+                    GetWeixinDllBase() + offset::appmsg_holder_write);
+                hw(holder, reinterpret_cast<uint64_t>(data), size);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+        return 1;
+    }
+    static char __fastcall MyAppMsgResponse(uint64_t self, uint64_t holder)
+    {
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AppMsgResponseCalls));
+        __try {
+            uintptr_t base = GetWeixinDllBase();
+            using HolderSize_t = __int64(__fastcall*)(uint64_t);
+            using HolderData_t = __int64(__fastcall*)(uint64_t, int);
+            HolderSize_t hs = reinterpret_cast<HolderSize_t>(base + offset::appmsg_holder_size);
+            HolderData_t hd = reinterpret_cast<HolderData_t>(base + offset::appmsg_holder_data);
+            uint32_t size = static_cast<uint32_t>(hs(holder));
+            const uint8_t* data = reinterpret_cast<const uint8_t*>(hd(holder, 0));
+            InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_AppMsgLastRespSize),
+                                  static_cast<LONG64>(size));
+            int ret = 0;
+            if (data && size && size < 8u * 1024u * 1024u)
+                ret = ParseSendAppMsgRet(data, size);
+            InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_AppMsgLastRet),
+                                  static_cast<LONG64>(ret));
+            AppMsgEnsureCs();
+            EnterCriticalSection(&g_appmsgCs);
+            for (int i = 0; i < 16; ++i) {
+                if (static_cast<uint64_t>(g_appmsgPending[i].taskPtr) == self) {
+                    g_appmsgPending[i].ret = ret;
+                    InterlockedExchange(&g_appmsgPending[i].done, 1);
+                    if (g_appmsgPending[i].evt) SetEvent(g_appmsgPending[i].evt);
+                    break;
+                }
+            }
+            LeaveCriticalSection(&g_appmsgCs);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+        return 1;
+    }
+
+    static void*        g_appmsgVtable[6]  = {};
+    static void*        g_appmsgVtable2[4] = {};
+    static volatile LONG g_appmsgVtableState = 0;
+    static void AppMsgEnsureVtable()
+    {
+        if (InterlockedCompareExchange(&g_appmsgVtableState, 1, 0) == 0) {
+            g_appmsgVtable[0] = reinterpret_cast<void*>(&MyAppMsgDtor);
+            g_appmsgVtable[1] = reinterpret_cast<void*>(&MyAppMsgSerialize);
+            g_appmsgVtable[2] = reinterpret_cast<void*>(&MyAppMsgResponse);
+            g_appmsgVtable[3] = reinterpret_cast<void*>(&MyAppMsgGetInner);
+            g_appmsgVtable[4] = reinterpret_cast<void*>(&MyAppMsgDummy);
+            g_appmsgVtable[5] = reinterpret_cast<void*>(static_cast<uintptr_t>(1));
+            g_appmsgVtable2[0] = reinterpret_cast<void*>(&MyAppMsgDummy);
+            g_appmsgVtable2[1] = reinterpret_cast<void*>(&MyAppMsgDummy);
+            g_appmsgVtable2[2] = reinterpret_cast<void*>(&MyAppMsgDummy);
+            g_appmsgVtable2[3] = reinterpret_cast<void*>(&MyAppMsgDummy);
+            InterlockedExchange(&g_appmsgVtableState, 2);
+        }
+        while (g_appmsgVtableState != 2)
+            Sleep(0);
+    }
+
+    // SEH-guarded task build + dispatch.  POD only (raw pointers + Win32
+    // handles), so __try/__except is legal.  The task, task_info, callback
+    // holder and pre-serialized request bytes are all intentionally leaked so
+    // the async worker can never hit a use-after-free.
+    static bool SubmitAppMsgTask(uintptr_t base, uint64_t manager,
+                                 const uint8_t* reqData, uint32_t reqSize,
+                                 uint32_t timeoutMs, int* outRet)
+    {
+        if (!base || !manager || !reqData || !reqSize)
+            return false;
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AppMsgSendCalls));
+        AppMsgEnsureCs();
+        AppMsgEnsureVtable();
+
+        static const char kEndpoint[] = "/cgi-bin/micromsg-bin/sendappmsg"; // 32 chars
+
+        HANDLE evt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!evt)
+            return false;
+
+        void* task_info = ::HeapAlloc(::GetProcessHeap(), HEAP_ZERO_MEMORY, 0x40);
+        void* task      = ::HeapAlloc(::GetProcessHeap(), HEAP_ZERO_MEMORY, 0x200);
+        void* cbHolder  = ::HeapAlloc(::GetProcessHeap(), HEAP_ZERO_MEMORY, 0x08);
+        if (!task_info || !task || !cbHolder) {
+            CloseHandle(evt);
+            return false;
+        }
+
+        bool dispatched = false;
+        __try {
+            // task_info layout (verified against sub_7FFE9200F120):
+            uint8_t* ti = static_cast<uint8_t*>(task_info);
+            ti[0]  = 0xDE;                                    // header (echoes cgi id)
+            ti[12] = 0x01;                                    // dword@+12 != 0 => task+57 flag
+            *reinterpret_cast<uint32_t*>(ti + 16) = 222;      // cgi type => task+12
+            *reinterpret_cast<uint32_t*>(ti + 20) = 0;        // => task+80
+            *reinterpret_cast<uint64_t*>(ti + 24) =           // endpoint data ptr (cap>=16 branch)
+                reinterpret_cast<uint64_t>(kEndpoint);
+            *reinterpret_cast<uint64_t*>(ti + 40) = 32;       // endpoint len
+            *reinterpret_cast<uint64_t*>(ti + 48) = 47;       // endpoint cap
+            ti[56] = 0x01;                                    // byte@+56 => task+59
+
+            using TaskCtor_t = void(__fastcall*)(void*, void*);
+            TaskCtor_t ctor = reinterpret_cast<TaskCtor_t>(base + offset::appmsg_task_ctor);
+            ctor(task, task_info);
+
+            // Override the task vtable + response-callback holder so no native
+            // serialize/destruct ever runs on our leaked task.
+            *reinterpret_cast<uint64_t*>(task) = reinterpret_cast<uint64_t>(&g_appmsgVtable[0]);
+            *reinterpret_cast<uint64_t*>(cbHolder) = reinterpret_cast<uint64_t>(&g_appmsgVtable2[0]);
+            *reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(task) + 208) =
+                reinterpret_cast<uint64_t>(cbHolder);
+
+            AppMsgRegister(reinterpret_cast<uint64_t>(task), reqData, reqSize, evt);
+
+            // Dispatch through the live network manager: manager->vtable[5].
+            using Dispatch_t = __int64(__fastcall*)(uint64_t, uint64_t);
+            uint64_t mvt = *reinterpret_cast<uint64_t*>(manager);
+            Dispatch_t dispatch = *reinterpret_cast<Dispatch_t*>(mvt + 40);
+            dispatch(manager, reinterpret_cast<uint64_t>(task));
+            dispatched = true;
+            InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AppMsgDispatchOk));
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            dispatched = false;
+            InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_AppMsgDispatchFail));
+        }
+
+        if (dispatched && timeoutMs)
+            WaitForSingleObject(evt, timeoutMs);
+
+        LONG done = 0; int ret = 0;
+        AppMsgUnregister(reinterpret_cast<uint64_t>(task), &done, &ret);
+        if (outRet) *outRet = ret;
+        // Success = the task was dispatched through the live manager.  The
+        // response-notify callback (vtable slot[2]) is best-effort: the card is
+        // already handed to WeChat's network worker at dispatch time and sends
+        // regardless of whether our reply parse lands inside the timeout.  When
+        // no response arrives, `ret` stays 0 (initial), so the caller treats it
+        // as success; only a response that actually parses a non-zero
+        // BaseResponse.ret marks a real server-side rejection.
+        (void)done;
+        return dispatched;
+    }
+
+    // Resolve the current account's REAL internal wxid (wxid_xxx), which the
+    // sendappmsg CGI requires as AppMsg.fromusername.  SelfInfo.wxid may hold
+    // the human alias (e.g. "python100day") which the server rejects (ret=-2),
+    // so prefer, in order:
+    //   1) the self wxid captured live at the sync-message hook (object+0x38),
+    //   2) the wxid parsed from the captured contact-DB path
+    //      (...\xwechat_files\<wxid>_<suffix>\db_storage\contact\contact.db),
+    //   3) SelfInfo.wxid only if it already looks like a wxid_ id.
+    static std::string ResolveSelfWxid()
+    {
+        auto looksLikeWxid = [](const std::string& s) {
+            return s.size() > 5 && s.rfind("wxid_", 0) == 0;
+        };
+
+        // 1) live self wxid from the message hook.
+        std::string live(g_SyncBatchText2);
+        if (looksLikeWxid(live))
+            return live;
+
+        // 2) parse the contact-DB path folder name.
+        std::string path(g_SqliteContactDbPath);
+        const char* marker = "xwechat_files\\";
+        size_t p = path.find(marker);
+        if (p != std::string::npos) {
+            size_t start = p + strlen(marker);
+            size_t end = path.find('\\', start);
+            if (end != std::string::npos && end > start) {
+                std::string folder = path.substr(start, end - start);
+                // folder = "<wxid>_<suffix>": strip the trailing "_<suffix>"
+                // only when there is more than one underscore (the first one
+                // belongs to the "wxid_" prefix itself).
+                if (folder.rfind("wxid_", 0) == 0) {
+                    size_t last = folder.rfind('_');
+                    if (last != std::string::npos &&
+                        folder.find('_') != last) {
+                        folder = folder.substr(0, last);
+                    }
+                    if (looksLikeWxid(folder))
+                        return folder;
+                }
+            }
+        }
+
+        // 3) last resort: SelfInfo.wxid if it is already a wxid_ id.
+        if (looksLikeWxid(SelfInfo.wxid))
+            return SelfInfo.wxid;
+        return std::string();
+    }
+
+    bool SendAppMsg(const std::string& to_wxid, const std::string& xml,
+                    uint64_t type)
+    {
+        if (to_wxid.empty() || xml.empty() || !GetModuleHandleA("Weixin.dll"))
+            return false;
+        uintptr_t base = GetWeixinDllBase();
+        if (!base)
+            return false;
+        // Live network manager captured passively at the F120 submit hook.  A
+        // prior real card send/forward THIS login is required to populate it.
+        uint64_t manager = static_cast<uint64_t>(g_AppMsgSubmitManager);
+        if (!manager)
+            return false;
+        std::string fromWxid = ResolveSelfWxid();
+        if (fromWxid.empty())
+            return false;
+
+        // clientmsgid: "{tick}{tid}" (mirrors the reference project).
+        char cmidBuf[64];
+        snprintf(cmidBuf, sizeof(cmidBuf), "%llu%lu",
+                 static_cast<unsigned long long>(::GetTickCount64()),
+                 static_cast<unsigned long>(::GetCurrentThreadId()));
+        std::string cmid(cmidBuf);
+
+        std::string req = BuildSendAppMsgReq(fromWxid, to_wxid, xml,
+                                             static_cast<uint32_t>(type), cmid);
+        if (req.empty() || req.size() > 4u * 1024u * 1024u)
+            return false;
+
+        // Leak the serialized bytes: the async worker's serialize callback
+        // reads them on another thread, so freeing here would risk a UAF.
+        uint8_t* leaked = static_cast<uint8_t*>(
+            ::HeapAlloc(::GetProcessHeap(), 0, req.size()));
+        if (!leaked)
+            return false;
+        memcpy(leaked, req.data(), req.size());
+
+        int ret = 0;
+        bool ok = SubmitAppMsgTask(base, manager, leaked,
+                                   static_cast<uint32_t>(req.size()), 1500, &ret);
+        return ok && ret == 0;
     }
 
 }

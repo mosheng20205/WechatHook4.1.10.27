@@ -4,6 +4,7 @@
 #include "tools.h"
 #include "global.h"
 #include "db_mgr.h"
+#include "auto_reply.h"
 
 #include "QueryDB.h"
 
@@ -149,6 +150,18 @@ void Route_QueryDB(httplib::Server& svr)
         resp["RawSyncMsgLastItem"] = g_RawSyncMsgLastItem;
         resp["RawSyncMsgLastType"] = g_RawSyncMsgLastType;
         resp["SyncBatchProcessorCalls"] = g_SyncBatchProcessorCalls;
+        resp["AppMsgSendCalls"] = g_AppMsgSendCalls;
+        resp["AppMsgDispatchOk"] = g_AppMsgDispatchOk;
+        resp["AppMsgDispatchFail"] = g_AppMsgDispatchFail;
+        resp["AppMsgSerializeCalls"] = g_AppMsgSerializeCalls;
+        resp["AppMsgResponseCalls"] = g_AppMsgResponseCalls;
+        resp["AppMsgLastRespSize"] = g_AppMsgLastRespSize;
+        resp["AppMsgLastRet"] = g_AppMsgLastRet;
+        resp["AppMsgSubmitManager"] = g_AppMsgSubmitManager;
+        resp["AppMsgSubmitCalls"] = g_AppMsgSubmitCalls;
+        resp["AppMsgSubmitHookInstalled"] = g_AppMsgSubmitHookInstalled;
+        resp["TaskDispatchCalls"] = g_TaskDispatchCalls;
+        resp["TaskDispatchHookInstalled"] = g_TaskDispatchHookInstalled;
         resp["SyncBatchItemCount"] = g_SyncBatchItemCount;
         resp["SyncBatchLastContext"] = g_SyncBatchLastContext;
         resp["SyncBatchLastVector"] = g_SyncBatchLastVector;
@@ -198,6 +211,24 @@ void Route_QueryDB(httplib::Server& svr)
         resp["SendElementObserveField1"] = std::string(g_SendElementObserveField1);
         resp["SendElementObserveField10"] = std::string(g_SendElementObserveField10);
         resp["SendElementObserveField20"] = std::string(g_SendElementObserveField20);
+        resp["SendContentObserveCalls"] = g_SendContentObserveCalls;
+        resp["SendContentObserveLastArg1"] = g_SendContentObserveLastArg1;
+        resp["SendContentObserveLastArg2"] = g_SendContentObserveLastArg2;
+        resp["SendContentObserveLastObject"] = g_SendContentObserveLastObject;
+        resp["SendContentObserveLastVtable"] = g_SendContentObserveLastVtable;
+        resp["SendContentObserveReceiverOffset"] = g_SendContentObserveReceiverOffset;
+        resp["SendContentObserveContentOffset"] = g_SendContentObserveContentOffset;
+        resp["SendContentObserveHookInstalled"] = g_SendContentObserveHookInstalled;
+        resp["SendContentObserveReport"] = std::string(g_SendContentObserveReport);
+        resp["XmlProbeArmed"] = g_XmlProbeArmed;
+        resp["XmlProbeCaptured"] = g_XmlProbeCaptured;
+        resp["XmlProbeSendCalls"] = g_XmlProbeSendCalls;
+        resp["XmlProbeVtableRva"] = g_XmlProbeVtableRva;
+        resp["XmlProbeXmlOffset"] = g_XmlProbeXmlOffset;
+        resp["XmlProbeWxidOffset"] = g_XmlProbeWxidOffset;
+        resp["XmlProbeFieldMap"] = std::string(g_XmlProbeFieldMap);
+        resp["ForwardObserveCalls"] = g_ForwardObserveCalls;
+        resp["ForwardObserveHookInstalled"] = g_ForwardObserveHookInstalled;
         resp["SysMsgParserCalls"] = g_SysMsgParserCalls;
         resp["HistoryAddMsgCalls"] = g_HistoryAddMsgCalls;
         resp["HistoryAddMsgCommitCalls"] = g_HistoryAddMsgCommitCalls;
@@ -447,7 +478,14 @@ void Route_QueryDB(httplib::Server& svr)
             });
         }
         resp["hWeixin"] = (uint64_t)g_hWeixinDll;
-        res.set_content(resp.dump(4, ' ', false), "application/json; charset=utf-8");
+        // Full auto-reply config alongside the counters (plan requirement:
+        // config structure + status counts both surfaced on /QueryDB/status).
+        try {
+            resp["AutoReplyConfig"] = json::parse(AutoReply::ToJsonString());
+        } catch (...) {
+            resp["AutoReplyConfig"] = nullptr;
+        }
+        res.set_content(resp.dump(4, ' ', false, nlohmann::json::error_handler_t::replace), "application/json; charset=utf-8");
         });
 
 
