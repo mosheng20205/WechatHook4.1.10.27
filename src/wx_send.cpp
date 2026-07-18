@@ -1235,4 +1235,43 @@ namespace WeixinSend
         return ok && ret == 0;
     }
 
+    // Insert a LOCAL system-tip message into conversation `talker` via the
+    // native local-sysmsg inserter sub_184C280B0(unused, WeixinString* talker,
+    // WeixinString* content).  The native routine wraps `content` in
+    // <sysmsg type="paymsg"><content><![CDATA[...]]></content></sysmsg>, builds
+    // a type-10000 local message object and inserts it through sub_18173DA00.
+    // No network I/O.  Call ONLY from a worker thread.  The two WeixinString
+    // heap buffers are intentionally leaked (recalls are rare; freeing a buffer
+    // the native copy path might still reference risks a fault), mirroring the
+    // deliberate small leaks elsewhere in this file.
+    bool InsertLocalSysTip(const std::string& talker, const std::string& text)
+    {
+        if (talker.empty() || text.empty() || !GetModuleHandleA("Weixin.dll"))
+            return false;
+        uintptr_t base = GetWeixinDllBase();
+        if (!base)
+            return false;
+
+        // Stack-resident WeixinString descriptors; SetWeixinString copies the
+        // payload into a process-heap buffer for length >= 16 (both a wxid and
+        // a recall notice exceed the 16-byte SSO threshold in practice).  The
+        // native inserter reads (copies) both synchronously before returning.
+        WeixinString talkerWS;
+        WeixinString textWS;
+        SetWeixinString(&talkerWS, talker);
+        SetWeixinString(&textWS, text);
+
+        using InsertFn = __int64(__fastcall*)(void*, void*, void*);
+        InsertFn insert = reinterpret_cast<InsertFn>(base + offset::revoke_tip_insert);
+
+        bool ok = false;
+        __try {
+            insert(nullptr, &talkerWS, &textWS);
+            ok = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            ok = false;
+        }
+        return ok;
+    }
+
 }

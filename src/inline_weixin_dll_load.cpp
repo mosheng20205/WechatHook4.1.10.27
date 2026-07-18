@@ -6,6 +6,7 @@
 #include <winternl.h>
 #include <cstring>
 #include <cctype>
+#include <cstdlib>
 #include <sstream>
 #include <condition_variable>
 #include <chrono>
@@ -153,23 +154,58 @@ void Patch_Low_Version_m2()
 
 
 //启用防撤回
-void Patch_Revoke()
+// True anti-revoke for Weixin 4.1.10.27.  sub_1822D07C0+0x227 (== module+0x22D09E7)
+// is `0F 84 xx xx xx xx` = `jz loc_1822D0B08`, taken right after
+// sub_1809F05E0(a1+416) decides "is this the revoke sysmsg family?".  Rewriting
+// the first two bytes to `90 E9` turns it into `nop; jmp loc_1822D0B08` (the jcc
+// rel32 is preserved and the jmp lands on the same target), so the revoke-apply
+// branch is ALWAYS skipped and the recalled message -- text or image -- is never
+// overwritten/removed from the store or UI.  Byte-verified and fully reversible.
+static BYTE g_AntiRevokeSavedBytes[2] = {0, 0};
+static bool g_AntiRevokeBytesSaved = false;
+
+bool AntiRevoke_Enable()
 {
-    // 计算目标地址
-    DWORD_PTR targetAddress = (DWORD_PTR)g_hWeixinDll + g_Patch_Revoke;
-
-    // 直接通过指针修改
-    BYTE* pTarget = (BYTE*)targetAddress;
-
-    // 修改内存保护属性
-    DWORD oldProtect;
-    VirtualProtect(pTarget, 2, PAGE_EXECUTE_READWRITE, &oldProtect);
-
-    *pTarget = 0x90;           // 第一个字节改为 nop
-    *(pTarget + 1) = 0xE9;     // 第二个字节改为 jmp 操作码
-
-    // 恢复保护属性
+    if (!g_hWeixinDll)
+        return false;
+    BYTE* pTarget = reinterpret_cast<BYTE*>(reinterpret_cast<DWORD_PTR>(g_hWeixinDll) + g_Patch_Revoke);
+    // Refuse unless the site is the expected conditional jump (0F 84) or already
+    // our patch (90 E9); never blindly stomp unknown bytes on a shifted build.
+    if (!(pTarget[0] == 0x0F && pTarget[1] == 0x84) &&
+        !(pTarget[0] == 0x90 && pTarget[1] == 0xE9))
+        return false;
+    if (!g_AntiRevokeBytesSaved) {
+        g_AntiRevokeSavedBytes[0] = pTarget[0];
+        g_AntiRevokeSavedBytes[1] = pTarget[1];
+        g_AntiRevokeBytesSaved = true;
+    }
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(pTarget, 2, PAGE_EXECUTE_READWRITE, &oldProtect))
+        return false;
+    pTarget[0] = 0x90;           // nop
+    pTarget[1] = 0xE9;           // jmp rel32 (reuses the preserved jcc displacement)
     VirtualProtect(pTarget, 2, oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), pTarget, 2);
+    InterlockedExchange(&g_AntiRevokeEnabled, 1);
+    return true;
+}
+
+bool AntiRevoke_Disable()
+{
+    if (!g_hWeixinDll || !g_AntiRevokeBytesSaved) {
+        InterlockedExchange(&g_AntiRevokeEnabled, 0);
+        return true;
+    }
+    BYTE* pTarget = reinterpret_cast<BYTE*>(reinterpret_cast<DWORD_PTR>(g_hWeixinDll) + g_Patch_Revoke);
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(pTarget, 2, PAGE_EXECUTE_READWRITE, &oldProtect))
+        return false;
+    pTarget[0] = g_AntiRevokeSavedBytes[0];
+    pTarget[1] = g_AntiRevokeSavedBytes[1];
+    VirtualProtect(pTarget, 2, oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), pTarget, 2);
+    InterlockedExchange(&g_AntiRevokeEnabled, 0);
+    return true;
 }
 
 
@@ -275,6 +311,29 @@ static LONG g_MessageDbStructHookState = 0;
 using FnSysMsgParser = int64_t(__fastcall*)(int64_t, int64_t, int64_t);
 static FnSysMsgParser g_OriginalSysMsgParser = nullptr;
 static LONG g_SysMsgParserHookState = 0;
+// sub_1822D1640 is called by the verified revoke-message handler after the
+// revokemsg XML has been parsed.  Keep this observation-only until its
+// downstream delete/replace calls are confirmed.
+using FnRevokePostParser = int64_t(__fastcall*)(int64_t, int64_t, int64_t, int64_t);
+static FnRevokePostParser g_OriginalRevokePostParser = nullptr;
+static LONG g_RevokePostParserHookState = 0;
+using FnRevokeBranch = int64_t(__fastcall*)(int64_t, int64_t);
+static FnRevokeBranch g_OriginalRevokeBranch8B70 = nullptr;
+static FnRevokeBranch g_OriginalRevokeBranch5E70 = nullptr;
+static FnRevokeBranch g_OriginalRevokeBranch74B0 = nullptr;
+static LONG g_RevokeBranchHooksState = 0;
+static FnRevokeBranch g_OriginalRevokeBranchC8B80 = nullptr;
+static FnRevokeBranch g_OriginalRevokeBranchA66280 = nullptr;
+static FnRevokeBranch g_OriginalRevokeBranch71CA0 = nullptr;
+using FnRevokeHandler = char(__fastcall*)(int64_t, int64_t, int64_t);
+static FnRevokeHandler g_OriginalRevokeHandler = nullptr;
+static LONG g_RevokeHandlerHookState = 0;
+using FnRevokeDispatchInit = void(__fastcall*)(int64_t, char);
+static FnRevokeDispatchInit g_OriginalRevokeDispatchInit = nullptr;
+static LONG g_RevokeDispatchInitHookState = 0;
+using FnRevokeMessageSubmit = int64_t(__fastcall*)(int64_t, int64_t, int64_t, int64_t);
+static FnRevokeMessageSubmit g_OriginalRevokeMessageSubmit = nullptr;
+static LONG g_RevokeMessageSubmitHookState = 0;
 using FnHistoryAddMsgQuery = int64_t(__fastcall*)(int64_t, int64_t, int64_t, int64_t);
 static FnHistoryAddMsgQuery g_OriginalHistoryAddMsgQuery = nullptr;
 static LONG g_HistoryAddMsgQueryHookState = 0;
@@ -1793,6 +1852,15 @@ static void RecordSqliteBindTrace16(const char* apiName, sqlite3_stmt* stmt, int
     CaptureSqlText16(text16, len, item.text, g_SqliteInterestingBindText);
 }
 
+static void AttachSqliteTraceSql(uint64_t sequence, sqlite3_stmt* stmt, const std::string& sql)
+{
+    if (!sequence || !stmt)
+        return;
+    auto& item = g_SqliteBindTraces[sequence % kSqliteBindTraceCapacity];
+    if (item.sequence == sequence && item.stmt == reinterpret_cast<uint64_t>(stmt))
+        CopySafeText(sql.c_str(), item.sql, sizeof(item.sql));
+}
+
 static void CaptureSqliteDbPath(sqlite3* db, char* dst, size_t cap);
 static int IdentifyMicroMsgDatabase(sqlite3* db);
 
@@ -2228,6 +2296,33 @@ static size_t CopyNativeStringAt(int64_t object, size_t offset, char* dst, size_
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         dst[0] = 0;
         return 0;
+    }
+}
+
+// Read a naturally-aligned QWORD from object memory behind an SEH guard.
+// Kept as a standalone function so SEH-using callers stay free of C++ objects
+// that would require stack unwinding (MSVC C2712).
+static uint64_t ReadQwordSafe(int64_t address, uint64_t fallback)
+{
+    if (!address)
+        return fallback;
+    __try {
+        return *reinterpret_cast<const uint64_t*>(address);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return fallback;
+    }
+}
+
+// Read a naturally-aligned DWORD (e.g. the revoketime unix seconds field) behind
+// an SEH guard; standalone for the same C2712 reason as ReadQwordSafe.
+static uint32_t ReadDwordSafe(int64_t address, uint32_t fallback)
+{
+    if (!address)
+        return fallback;
+    __try {
+        return *reinterpret_cast<const uint32_t*>(address);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return fallback;
     }
 }
 
@@ -3606,6 +3701,225 @@ static void PostValidatedReceivedMessage(const std::string& from,
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_MessageCallbackPosts));
 }
 
+// ---- Revoke (recall) notification -----------------------------------------
+// A recall arrives as a validated micromsg.AddMsg with msgtype 10002 whose
+// content is a <sysmsg type="revokemsg"> document.  This is the same verified
+// SyncBatch capture path used for ordinary messages, so parsing is read-only
+// and never re-enters any send routine.
+
+static bool ContentIsRevoke(const std::string& content)
+{
+    return content.find("revokemsg") != std::string::npos;
+}
+
+// Return the inner text of the first <tag>...</tag>.  Bounded string search on
+// an already-validated, NUL-terminated content copy; empty when absent.
+static std::string ExtractXmlTagText(const std::string& xml, const char* tag)
+{
+    const std::string open = std::string("<") + tag + ">";
+    const std::string close = std::string("</") + tag + ">";
+    const size_t start = xml.find(open);
+    if (start == std::string::npos)
+        return std::string();
+    const size_t bodyStart = start + open.size();
+    const size_t end = xml.find(close, bodyStart);
+    if (end == std::string::npos || end < bodyStart)
+        return std::string();
+    return xml.substr(bodyStart, end - bodyStart);
+}
+
+// Strip a <![CDATA[ ... ]]> wrapper when present, otherwise return the value.
+static std::string StripCData(const std::string& value)
+{
+    const std::string open = "<![CDATA[";
+    const std::string close = "]]>";
+    const size_t s = value.find(open);
+    if (s == std::string::npos)
+        return value;
+    const size_t bodyStart = s + open.size();
+    const size_t e = value.find(close, bodyStart);
+    if (e == std::string::npos)
+        return value.substr(bodyStart);
+    return value.substr(bodyStart, e - bodyStart);
+}
+
+// Parse and push one recall event to the external webhook.  Emits a superset
+// of the ordinary receive envelope plus a parsed "revoke" object so external
+// services keep working while gaining the recaller / tip / newmsgid directly.
+static void PostRevokeNotification(const std::string& from,
+                                   const std::string& to,
+                                   const std::string& content,
+                                   const std::string& room,
+                                   const std::string& sender)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_RevokeDetectedCount));
+
+    const std::string tip = StripCData(ExtractXmlTagText(content, "replacemsg"));
+    const std::string newMsgIdStr = ExtractXmlTagText(content, "newmsgid");
+    uint64_t newMsgId = 0;
+    if (!newMsgIdStr.empty())
+        newMsgId = strtoull(newMsgIdStr.c_str(), nullptr, 10);
+
+    CopySafeText(from.c_str(), g_RevokeLastFrom, sizeof(g_RevokeLastFrom));
+    CopySafeText(sender.c_str(), g_RevokeLastSender, sizeof(g_RevokeLastSender));
+    CopySafeText(tip.c_str(), g_RevokeLastTip, sizeof(g_RevokeLastTip));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_RevokeLastNewMsgId),
+                          static_cast<LONG64>(newMsgId));
+
+    if (g_CallBack_Url.empty() || from.empty())
+        return;
+
+    json item;
+    item["cmdId"] = 5;
+    item["msgtype"] = 10002;
+    item["msgtypename"] = "recall";
+    item["fromid"] = from;
+    item["toid"] = to;
+    item["room"] = room;      // @chatroom id for group recalls, empty otherwise
+    item["sender"] = sender;  // recaller wxid (group member) or the friend wxid
+    item["msg"] = content;    // raw <sysmsg type="revokemsg"> document
+    item["msgsvrid"] = 0;
+    item["time"] = static_cast<uint64_t>(GetTickCount64());
+    item["event"] = "revoke";
+    json revoke;
+    revoke["newmsgid"] = newMsgId;  // server id of the recalled message
+    revoke["tip"] = tip;            // native "xxx 撤回了一条消息" wording
+    item["revoke"] = revoke;
+
+    json payload;
+    payload["ServerPort"] = g_StartPort;
+    payload["msgnumber"] = 1;
+    payload["sendorrecv"] = 2;
+    payload["selfwxid"] = SelfInfo.wxid;
+    payload["msglist"] = json::array({item});
+    HttpPostJsonAsync(g_CallBack_Url, payload.dump());
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_RevokePostedCount));
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_MessageCallbackPosts));
+}
+
+// Minimal CDATA-aware extraction of <tag>..</tag> from a raw sysmsg XML string.
+// Used as a fallback when the anti-revoke patch skips the parser's field-fill
+// branch, so the recall webhook still carries tip/session/newmsgid/revoketime.
+static std::string ExtractXmlTag(const std::string& xml, const char* tag)
+{
+    const std::string open = std::string("<") + tag + ">";
+    const std::string close = std::string("</") + tag + ">";
+    const size_t a = xml.find(open);
+    if (a == std::string::npos)
+        return std::string();
+    const size_t start = a + open.size();
+    const size_t b = xml.find(close, start);
+    if (b == std::string::npos)
+        return std::string();
+    std::string v = xml.substr(start, b - start);
+    const std::string cdOpen = "<![CDATA[";
+    const std::string cdClose = "]]>";
+    if (v.compare(0, cdOpen.size(), cdOpen) == 0) {
+        const size_t e = v.rfind(cdClose);
+        if (e != std::string::npos && e >= cdOpen.size())
+            v = v.substr(cdOpen.size(), e - cdOpen.size());
+    }
+    return v;
+}
+
+// Track recently-seen recall keys so duplicate re-fires (the sysmsg parser can
+// run several times for one recall) and login-sync replays can be told apart
+// from genuinely new recalls.  Returns true the first time a key is seen this
+// session.  Bounded ring; no allocation; guarded by a tiny spin lock because the
+// parser thread is not guaranteed to be the only caller.
+static bool RevokeKeyIsNew(uint64_t key)
+{
+    static volatile LONG lock = 0;
+    static uint64_t ring[128] = {0};
+    static size_t head = 0;
+    static size_t count = 0;
+    if (key == 0)
+        return true;  // no stable key available; never blind-dedup
+    while (InterlockedCompareExchange(&lock, 1, 0) != 0)
+        YieldProcessor();
+    bool isNew = true;
+    for (size_t i = 0; i < count; ++i) {
+        if (ring[i] == key) { isNew = false; break; }
+    }
+    if (isNew) {
+        ring[head] = key;
+        head = (head + 1) % 128;
+        if (count < 128) ++count;
+    }
+    InterlockedExchange(&lock, 0);
+    return isNew;
+}
+
+// Push a recall event parsed directly from the sysmsg parser object built by
+// sub_1822D07C0.  Recalls on 4.1.10.27 do NOT travel through the validated
+// AddMsg SyncBatch path (SyncBatchFieldReadCalls stays flat on a recall); they
+// are dispatched here instead.  Two document variants are produced:
+//   Format 1 (revoketime present): object+0x1D0 <content> tip; NO <session>/
+//     <newmsgid>.  The chat/talker wxid is instead the "wxid:\n" prefix the
+//     caller (sub_1822D0540) stripped into message_node+0x58 == node-0x128.
+//   Format 2 (no revoketime): object+0x1F0 <session> chat wxid,
+//     object+0x1C8 <newmsgid> QWORD, object+0x1D0 <replacemsg> tip.
+// `talker` is the node-0x128 prefix; `revokeTime` is object+0x2B0 (unix secs,
+// Format 1 only).  This observer is read-only and never re-enters a send path.
+static void PostRevokeFromSysMsg(const std::string& tip,
+                                 const std::string& session,
+                                 const std::string& talker,
+                                 uint64_t newMsgId,
+                                 uint32_t revokeTime,
+                                 bool allowPost)
+{
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_RevokeDetectedCount));
+
+    // Format 2 carries the chat in <session>; Format 1 only has the stripped
+    // node prefix.  Prefer whichever is populated so single-chat recalls (which
+    // arrive as Format 1) still expose the counterparty wxid.
+    const std::string& chat = !session.empty() ? session : talker;
+
+    CopySafeText(chat.c_str(), g_RevokeLastFrom, sizeof(g_RevokeLastFrom));
+    CopySafeText(chat.c_str(), g_RevokeLastSender, sizeof(g_RevokeLastSender));
+    CopySafeText(tip.c_str(), g_RevokeLastTip, sizeof(g_RevokeLastTip));
+    CopySafeText(talker.c_str(), g_RevokeLastTalker, sizeof(g_RevokeLastTalker));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_RevokeLastNewMsgId),
+                          static_cast<LONG64>(newMsgId));
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_RevokeLastRevokeTime),
+                          static_cast<LONG64>(revokeTime));
+
+    // `allowPost` is false for duplicate re-fires / login-sync replays already
+    // seen this session; still refresh the diagnostic fields above but skip the
+    // webhook so consumers are not spammed with the same recall.
+    if (!allowPost || g_CallBack_Url.empty())
+        return;
+
+    const bool isRoom = IsGroupWxid(chat);
+    json item;
+    item["cmdId"] = 5;
+    item["msgtype"] = 10002;
+    item["msgtypename"] = "recall";
+    item["fromid"] = chat;                             // chat/talker wxid (may be empty)
+    item["toid"] = SelfInfo.wxid;
+    item["room"] = isRoom ? chat : std::string();     // @chatroom id for group recalls
+    item["sender"] = chat;
+    item["msg"] = tip;                                 // native recall wording
+    item["msgsvrid"] = 0;
+    item["time"] = static_cast<uint64_t>(GetTickCount64());
+    item["event"] = "revoke";
+    json revoke;
+    revoke["newmsgid"] = newMsgId;                     // server id of the recalled message
+    revoke["tip"] = tip;                               // "xxx \u64a4\u56de\u4e86\u4e00\u6761\u6d88\u606f"
+    revoke["revoketime"] = revokeTime;                 // unix secs (Format 1 only)
+    item["revoke"] = revoke;
+
+    json payload;
+    payload["ServerPort"] = g_StartPort;
+    payload["msgnumber"] = 1;
+    payload["sendorrecv"] = 2;
+    payload["selfwxid"] = SelfInfo.wxid;
+    payload["msglist"] = json::array({item});
+    HttpPostJsonAsync(g_CallBack_Url, payload.dump());
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_RevokePostedCount));
+    InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_MessageCallbackPosts));
+}
+
 struct AddMsgCapture {
     bool captured = false;
     bool gotFrom = false;
@@ -3689,11 +4003,18 @@ static bool CaptureValidatedAddMsgItem(int64_t item)
 
         // Structured receive fan-out for every message type (text/image/voice/
         // video/file/quote/system) goes to the external service; auto-reply is
-        // still gated by the rules engine and only meaningful for text.
-        PostValidatedReceivedMessage(fromValue, toValue, contentValue,
-                                     capture.msgType, room, sender);
-        if (capture.gotMsgType && capture.msgType == 1)
-            ClassifyAndQueueAutoReply(fromValue, toValue, contentValue);
+        // still gated by the rules engine and only meaningful for text.  A
+        // recall (<sysmsg type="revokemsg">) is enriched into a parsed revoke
+        // event instead of the generic envelope so subscribers get the
+        // recaller / tip / newmsgid directly.
+        if (ContentIsRevoke(contentValue)) {
+            PostRevokeNotification(fromValue, toValue, contentValue, room, sender);
+        } else {
+            PostValidatedReceivedMessage(fromValue, toValue, contentValue,
+                                         capture.msgType, room, sender);
+            if (capture.gotMsgType && capture.msgType == 1)
+                ClassifyAndQueueAutoReply(fromValue, toValue, contentValue);
+        }
     }
     return true;
 }
@@ -4480,6 +4801,123 @@ static int64_t __fastcall Hook_SysMsgParser(int64_t object, int64_t node, int64_
     CopyNativeStringAt(object, 0x1D0, g_MessageStructContent, sizeof(g_MessageStructContent)); // content/replacemsg
     CopyNativeStringAt(object, 0x1F0, g_MessageStructExtra1, sizeof(g_MessageStructExtra1));    // session
     CopyNativeStringAt(object, 0x350, g_MessageStructExtra2, sizeof(g_MessageStructExtra2));    // replacemsg variant
+
+    // Recall (anti-revoke) notification.  sub_1822D07C0 dispatches every sysmsg
+    // subtype through this one entry; only act when the parsed <sysmsg type=...>
+    // at object+0x1A0 is exactly "revokemsg".  Read fresh, bounded local copies
+    // so the webhook payload cannot race the shared diagnostic globals.  The
+    // recalled server id (object+0x1C8) is only populated by the session variant
+    // of the document and is guarded; the revoketime variant leaves it zeroed.
+    if (strcmp(g_MessageStructTalker, "revokemsg") == 0) {
+        char tipBuf[4096]{};
+        char sessionBuf[4096]{};
+        char talkerBuf[4096]{};
+        CopyNativeStringAt(object, 0x1D0, tipBuf, sizeof(tipBuf));
+        CopyNativeStringAt(object, 0x1F0, sessionBuf, sizeof(sessionBuf));
+        // The caller sub_1822D0540 stripped the "wxid:\n" prefix of the sync
+        // envelope into message_node+0x58.  Our `node` arg == message_node+0x180
+        // (caller passes a2+48 QWORDs), so the talker string sits at node-0x128.
+        // This is filled BEFORE the revoke branch, so it survives anti-revoke.
+        CopyNativeStringAt(node - 0x128, 0, talkerBuf, sizeof(talkerBuf));
+        uint64_t newMsgId = ReadQwordSafe(object + 0x1C8, 0);
+        uint32_t revokeTime = ReadDwordSafe(object + 0x2B0, 0);  // unix secs (Format 1)
+
+        std::string tip = tipBuf;
+        std::string session = sessionBuf;
+        const std::string talker = talkerBuf;
+
+        // When anti-revoke is enabled the parser's field-fill branch is skipped,
+        // leaving object+0x1D0/0x1F0/0x1C8 empty.  Recover the same fields from
+        // the raw sysmsg XML held in `node` (a2) so the webhook still works.
+        if (tip.empty() || session.empty() || newMsgId == 0) {
+            char xmlBuf[8192]{};
+            CopyNativeStringAt(node, 0, xmlBuf, sizeof(xmlBuf));
+            const std::string xml = xmlBuf;
+            if (!xml.empty()) {
+                if (tip.empty()) {
+                    tip = ExtractXmlTag(xml, "replacemsg");
+                    if (tip.empty()) tip = ExtractXmlTag(xml, "content");
+                }
+                if (session.empty())
+                    session = ExtractXmlTag(xml, "session");
+                if (newMsgId == 0) {
+                    const std::string s = ExtractXmlTag(xml, "newmsgid");
+                    if (!s.empty()) newMsgId = strtoull(s.c_str(), nullptr, 10);
+                }
+                if (revokeTime == 0) {
+                    const std::string s = ExtractXmlTag(xml, "revoketime");
+                    if (!s.empty()) revokeTime = static_cast<uint32_t>(strtoul(s.c_str(), nullptr, 10));
+                }
+            }
+        }
+
+        // Stable per-recall key: Format 2 has a real newmsgid; Format 1 lacks it
+        // so synthesize from revoketime + FNV(talker+tip).  New keys pass to the
+        // webhook; repeats (re-fire / login replay within session) are counted
+        // and suppressed.
+        uint64_t key = newMsgId;
+        if (key == 0) {
+            uint64_t h = 1469598103934665603ULL;
+            for (char c : talker) { h ^= static_cast<uint8_t>(c); h *= 1099511628211ULL; }
+            for (char c : tip)    { h ^= static_cast<uint8_t>(c); h *= 1099511628211ULL; }
+            key = (static_cast<uint64_t>(revokeTime) << 32) ^ h;
+        }
+        const bool isNew = RevokeKeyIsNew(key);
+        if (isNew)
+            InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_RevokeDistinctCount));
+        else
+            InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_RevokeSuppressedCount));
+        PostRevokeFromSysMsg(tip, session, talker, newMsgId, revokeTime, isNew);
+
+        // Experimental recall-tip injection.  When anti-revoke is keeping the
+        // recalled bubble visible, additionally drop a local
+        // "<name> 撤回了一条消息" notice into the SAME conversation so the chat
+        // shows both the preserved original AND the recall notice.  Gated
+        // (default OFF) and only for genuinely-new recalls.  InsertLocalSysTip
+        // is SEH-guarded.
+        if (isNew && g_AntiRevokeEnabled && g_RevokeTipInjectEnabled) {
+            const std::string chat = !session.empty() ? session : talker;
+            // Build a clean, human-readable notice.  `tip` is frequently the raw
+            // <sysmsg type="revokemsg">...</sysmsg> envelope, so pull the inner
+            // <replacemsg>/<content> text; wrapping the whole XML in another
+            // CDATA renders as garbage.  Fall back to a generic notice.
+            std::string notice = tip;
+            if (notice.find('<') != std::string::npos) {
+                std::string inner = ExtractXmlTag(notice, "replacemsg");
+                if (inner.empty()) inner = ExtractXmlTag(notice, "content");
+                notice = inner;
+            }
+            if (notice.empty())
+                notice = "对方撤回了一条消息";
+            if (!chat.empty()) {
+                InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_RevokeTipInjectCalls));
+                // Insert on THIS thread (the same message-processing thread that
+                // just displayed the preserved bubble) so the native conversation
+                // objects have the right affinity; a detached worker thread reads
+                // them from the wrong thread and faults.  The original parser has
+                // already returned, so there is no mid-parse re-entrancy, and the
+                // local insert never routes back through this sysmsg parser.
+                const bool ok = WeixinSend::InsertLocalSysTip(chat, notice);
+                InterlockedIncrement(reinterpret_cast<volatile LONG*>(
+                    ok ? &g_RevokeTipInjectOk : &g_RevokeTipInjectFail));
+            }
+        }
+
+        // Consume the sysmsg so the caller (sub_1822D0540) does NOT fall back to
+        // sub_1822D1640, which would render the raw <sysmsg type="revokemsg">
+        // XML as a visible message (the stray "微信用户" chat).  The jz@0x22D09E7
+        // patch left the parser returning 0 (unhandled); vanilla WeChat consumes
+        // a revokemsg by returning 1 with the out-byte cleared.  `flag` here is
+        // the caller's &out-byte (its 3rd arg); zero it and report handled.  This
+        // only changes the display decision and never removes the preserved
+        // bubble (that is governed by the separate byte patch).
+        if (g_AntiRevokeEnabled) {
+            if (flag)
+                *reinterpret_cast<volatile uint8_t*>(flag) = 0;
+            InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_RevokeConsumeOverrides));
+            return 1;
+        }
+    }
     return result;
 }
 
@@ -4494,6 +4932,179 @@ static void InstallSysMsgParserHook()
     {
         g_OriginalSysMsgParser = nullptr;
         InterlockedExchange(&g_SysMsgParserHookState, 0);
+    }
+}
+
+static int64_t __fastcall Hook_RevokePostParser(int64_t a1, int64_t a2,
+                                                int64_t a3, int64_t a4)
+{
+    RecordMessageBranchTrace("sub_1822D1640", reinterpret_cast<uint64_t>(g_hWeixinDll) + 0x22D1640,
+                             static_cast<uint64_t>(a1), static_cast<uint64_t>(a2),
+                             static_cast<uint64_t>(a3));
+    return g_OriginalRevokePostParser
+        ? g_OriginalRevokePostParser(a1, a2, a3, a4) : 0;
+}
+
+static void InstallRevokePostParserHook()
+{
+    if (InterlockedCompareExchange(&g_RevokePostParserHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x22D1640);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_RevokePostParser),
+                      reinterpret_cast<void**>(&g_OriginalRevokePostParser)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK)
+    {
+        g_OriginalRevokePostParser = nullptr;
+        InterlockedExchange(&g_RevokePostParserHookState, 0);
+    }
+}
+
+static int64_t __fastcall Hook_RevokeBranch8B70(int64_t a1, int64_t a2)
+{
+    RecordMessageBranchTrace("sub_1822D8B70", reinterpret_cast<uint64_t>(g_hWeixinDll) + 0x22D8B70,
+                             static_cast<uint64_t>(a1), static_cast<uint64_t>(a2), 0);
+    return g_OriginalRevokeBranch8B70 ? g_OriginalRevokeBranch8B70(a1, a2) : 0;
+}
+static int64_t __fastcall Hook_RevokeBranch5E70(int64_t a1, int64_t a2)
+{
+    RecordMessageBranchTrace("sub_1822D5E70", reinterpret_cast<uint64_t>(g_hWeixinDll) + 0x22D5E70,
+                             static_cast<uint64_t>(a1), static_cast<uint64_t>(a2), 0);
+    return g_OriginalRevokeBranch5E70 ? g_OriginalRevokeBranch5E70(a1, a2) : 0;
+}
+static int64_t __fastcall Hook_RevokeBranch74B0(int64_t a1, int64_t a2)
+{
+    RecordMessageBranchTrace("sub_1822D74B0", reinterpret_cast<uint64_t>(g_hWeixinDll) + 0x22D74B0,
+                             static_cast<uint64_t>(a1), static_cast<uint64_t>(a2), 0);
+    return g_OriginalRevokeBranch74B0 ? g_OriginalRevokeBranch74B0(a1, a2) : 0;
+}
+static int64_t __fastcall Hook_RevokeBranchC8B80(int64_t a1, int64_t a2)
+{
+    RecordMessageBranchTrace("sub_1822C8B80", reinterpret_cast<uint64_t>(g_hWeixinDll) + 0x22C8B80,
+                             static_cast<uint64_t>(a1), static_cast<uint64_t>(a2), 0);
+    return g_OriginalRevokeBranchC8B80 ? g_OriginalRevokeBranchC8B80(a1, a2) : 0;
+}
+static int64_t __fastcall Hook_RevokeBranchA66280(int64_t a1, int64_t a2)
+{
+    RecordMessageBranchTrace("sub_180A66280", reinterpret_cast<uint64_t>(g_hWeixinDll) + 0xA66280,
+                             static_cast<uint64_t>(a1), static_cast<uint64_t>(a2), 0);
+    return g_OriginalRevokeBranchA66280 ? g_OriginalRevokeBranchA66280(a1, a2) : 0;
+}
+static int64_t __fastcall Hook_RevokeBranch71CA0(int64_t a1, int64_t a2)
+{
+    RecordMessageBranchTrace("sub_180071CA0", reinterpret_cast<uint64_t>(g_hWeixinDll) + 0x71CA0,
+                             static_cast<uint64_t>(a1), static_cast<uint64_t>(a2), 0);
+    return g_OriginalRevokeBranch71CA0 ? g_OriginalRevokeBranch71CA0(a1, a2) : 0;
+}
+
+static void InstallRevokeBranchHooks()
+{
+    if (InterlockedCompareExchange(&g_RevokeBranchHooksState, 1, 0) != 0)
+        return;
+    struct Entry { uintptr_t rva; void* hook; void** original; } entries[] = {
+        {0x22D8B70, reinterpret_cast<void*>(&Hook_RevokeBranch8B70), reinterpret_cast<void**>(&g_OriginalRevokeBranch8B70)},
+        {0x22D5E70, reinterpret_cast<void*>(&Hook_RevokeBranch5E70), reinterpret_cast<void**>(&g_OriginalRevokeBranch5E70)},
+        {0x22D74B0, reinterpret_cast<void*>(&Hook_RevokeBranch74B0), reinterpret_cast<void**>(&g_OriginalRevokeBranch74B0)},
+        {0x22C8B80, reinterpret_cast<void*>(&Hook_RevokeBranchC8B80), reinterpret_cast<void**>(&g_OriginalRevokeBranchC8B80)},
+        {0xA66280, reinterpret_cast<void*>(&Hook_RevokeBranchA66280), reinterpret_cast<void**>(&g_OriginalRevokeBranchA66280)},
+    };
+    for (const auto& entry : entries) {
+        void* target = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(g_hWeixinDll) + entry.rva);
+        if (MH_CreateHook(target, entry.hook, entry.original) != MH_OK || MH_EnableHook(target) != MH_OK) {
+            InterlockedExchange(&g_RevokeBranchHooksState, 0);
+            return;
+        }
+    }
+}
+
+static char __fastcall Hook_RevokeHandler(int64_t a1, int64_t a2, int64_t a3)
+{
+    RecordMessageBranchTrace("sub_1822D0540", reinterpret_cast<uint64_t>(g_hWeixinDll) + 0x22D0540,
+                             static_cast<uint64_t>(a1), static_cast<uint64_t>(a2),
+                             static_cast<uint64_t>(a3));
+    // sub_180A1B820, reached after this parser, dispatches through the
+    // handler object at a1+0x278, vtable slot 2.  Record the live target so
+    // the delete/replace operation can be identified without changing it.
+    if (a1) {
+        auto handler = *reinterpret_cast<uintptr_t*>(a1 + 0x278);
+        if (handler) {
+            auto vtable = *reinterpret_cast<uintptr_t*>(handler);
+            if (vtable) {
+                RecordMessageBranchTrace("revoke_vtable_slot2", vtable + 0x10,
+                                         static_cast<uint64_t>(a1),
+                                         static_cast<uint64_t>(handler), 0);
+            }
+        }
+    }
+    return g_OriginalRevokeHandler ? g_OriginalRevokeHandler(a1, a2, a3) : 0;
+}
+
+static void InstallRevokeHandlerHook()
+{
+    if (InterlockedCompareExchange(&g_RevokeHandlerHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x22D0540);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_RevokeHandler),
+                      reinterpret_cast<void**>(&g_OriginalRevokeHandler)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK)
+    {
+        g_OriginalRevokeHandler = nullptr;
+        InterlockedExchange(&g_RevokeHandlerHookState, 0);
+    }
+}
+
+static void __fastcall Hook_RevokeDispatchInit(int64_t a1, char a2)
+{
+    if (g_OriginalRevokeDispatchInit)
+        g_OriginalRevokeDispatchInit(a1, a2);
+    if (!a1)
+        return;
+    auto handler = *reinterpret_cast<uintptr_t*>(a1 + 0x278);
+    if (!handler)
+        return;
+    auto vtable = *reinterpret_cast<uintptr_t*>(handler);
+    if (!vtable)
+        return;
+    RecordMessageBranchTrace("revoke_vtable_slot2", vtable + 0x10,
+                             static_cast<uint64_t>(a1),
+                             static_cast<uint64_t>(handler),
+                             static_cast<uint64_t>(a2));
+}
+
+static void InstallRevokeDispatchInitHook()
+{
+    if (InterlockedCompareExchange(&g_RevokeDispatchInitHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0xA1B820);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_RevokeDispatchInit),
+                      reinterpret_cast<void**>(&g_OriginalRevokeDispatchInit)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK)
+    {
+        g_OriginalRevokeDispatchInit = nullptr;
+        InterlockedExchange(&g_RevokeDispatchInitHookState, 0);
+    }
+}
+
+static int64_t __fastcall Hook_RevokeMessageSubmit(int64_t a1, int64_t a2,
+                                                   int64_t a3, int64_t a4)
+{
+    RecordMessageBranchTrace("sub_182EF46C0", reinterpret_cast<uint64_t>(g_hWeixinDll) + 0x2EF46C0,
+                             static_cast<uint64_t>(a1), static_cast<uint64_t>(a2),
+                             static_cast<uint64_t>(a3));
+    return g_OriginalRevokeMessageSubmit
+        ? g_OriginalRevokeMessageSubmit(a1, a2, a3, a4) : 0;
+}
+
+static void InstallRevokeMessageSubmitHook()
+{
+    if (InterlockedCompareExchange(&g_RevokeMessageSubmitHookState, 1, 0) != 0)
+        return;
+    void* target = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(g_hWeixinDll) + 0x2EF46C0);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_RevokeMessageSubmit),
+                      reinterpret_cast<void**>(&g_OriginalRevokeMessageSubmit)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK)
+    {
+        g_OriginalRevokeMessageSubmit = nullptr;
+        InterlockedExchange(&g_RevokeMessageSubmitHookState, 0);
     }
 }
 
@@ -4583,6 +5194,7 @@ static int Hook_SqliteBindText(sqlite3_stmt* stmt, int index, const char* text,
     CaptureSqliteDbHandleFromStmt(stmt);
     CaptureSqlText(text, nByte, g_SqliteLastBindText, g_SqliteInterestingBindText);
     RecordSqliteBindTrace("bind_text", stmt, index, text, nByte);
+    AttachSqliteTraceSql(g_SqliteBindTraceIndex, stmt, LookupSqliteStatement(stmt));
     const int rc = g_OriginalSqliteBindText
         ? g_OriginalSqliteBindText(stmt, index, text, nByte, destructor)
         : SQLITE_ERROR;
@@ -4602,6 +5214,7 @@ static int Hook_SqliteBindText16(sqlite3_stmt* stmt, int index, const void* text
     CaptureSqliteDbHandleFromStmt(stmt);
     CaptureSqlText16(text, nByte, g_SqliteLastBindText, g_SqliteInterestingBindText);
     RecordSqliteBindTrace16("bind_text16", stmt, index, text, nByte);
+    AttachSqliteTraceSql(g_SqliteBindTraceIndex, stmt, LookupSqliteStatement(stmt));
     const int rc = g_OriginalSqliteBindText16
         ? g_OriginalSqliteBindText16(stmt, index, text, nByte, destructor)
         : SQLITE_ERROR;
@@ -5198,7 +5811,9 @@ void Evt_WeixinLoad()
     //get base DirPath
     //InitStandardPaths();
     
-    //Patch_Revoke(); // disabled for 4.1.11.24
+    // Anti-revoke stays OFF at init; enable at runtime via POST /AntiRevoke/config
+    // {"enabled":true} once WeChat is logged in and stable.
+    // AntiRevoke_Enable();
 
 
     // 创建并启动HTTP服务器
@@ -5222,6 +5837,15 @@ void Evt_WeixinLoad()
     // message object. Keep it disabled while the safe 0x78-byte observation
     // boundary is being validated in Hook_SyncBatchProcessor.
     InstallMessageParserHook();
+    // Observe the verified 4.1.10.27 sysmsg/revokemsg parser.  This hook is
+    // intentionally read-only until the downstream delete/replace boundary
+    // is confirmed by a real revoke test.
+    InstallSysMsgParserHook();
+    InstallRevokePostParserHook();
+    InstallRevokeBranchHooks();
+    InstallRevokeHandlerHook();
+    InstallRevokeDispatchInitHook();
+    InstallRevokeMessageSubmitHook();
     InstallPbMessageParserHooks();
     InstallDbAddMessageHook();
     InstallRawSyncMsgProcessorHook();

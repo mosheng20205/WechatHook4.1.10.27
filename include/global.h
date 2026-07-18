@@ -72,6 +72,46 @@ extern char g_SyncBatchText4[4096];
 extern char g_SyncBatchFromUsername[4096];
 extern char g_SyncBatchToUsername[4096];
 extern char g_SyncBatchContent[4096];
+extern volatile uint64_t g_RevokeDetectedCount;
+extern volatile uint64_t g_RevokePostedCount;
+extern volatile uint64_t g_RevokeLastNewMsgId;
+extern char g_RevokeLastFrom[4096];
+extern char g_RevokeLastSender[4096];
+extern char g_RevokeLastTip[4096];
+extern char g_RevokeLastTalker[4096];
+extern volatile uint64_t g_RevokeLastRevokeTime;
+extern volatile uint64_t g_RevokeDistinctCount;
+extern volatile uint64_t g_RevokeSuppressedCount;
+
+// True anti-revoke: keep the recalled bubble (text AND image) visible by
+// skipping sub_1822D07C0's revoke-apply branch (jz@0x22D09E7 -> nop;jmp).
+// Default OFF, byte-verified and reversible; toggled via /AntiRevoke/config.
+extern volatile LONG g_AntiRevokeEnabled;
+bool AntiRevoke_Enable();
+bool AntiRevoke_Disable();
+
+// Experimental recall-tip injection: when anti-revoke keeps the recalled
+// bubble visible, optionally insert a local "<name> 撤回了一条消息" gray tip
+// into the SAME conversation via the native local-sysmsg inserter
+// (offset::revoke_tip_insert / sub_184C280B0), so the chat shows both the
+// preserved original AND the recall notice.  Default OFF; the injection runs
+// on a detached worker thread (never re-enters the receive hook) and is
+// SEH-guarded.  The native inserter hard-codes sysmsg type="paymsg", so the
+// on-screen rendering of arbitrary text is UNVERIFIED and must be confirmed on
+// a real client before this is ever default-enabled.  Toggled via
+// /RevokeTip/config.
+extern volatile LONG g_RevokeTipInjectEnabled;
+extern volatile uint64_t g_RevokeTipInjectCalls;
+extern volatile uint64_t g_RevokeTipInjectOk;
+extern volatile uint64_t g_RevokeTipInjectFail;
+
+// Anti-revoke side-effect fix: the jz@0x22D09E7 patch makes sub_1822D07C0
+// return 0 (unhandled) for revokemsg, so its caller sub_1822D0540 falls back to
+// sub_1822D1640 and DISPLAYS the raw <sysmsg type="revokemsg"> XML as a message
+// (leaking into a stray "微信用户" P2P chat).  When anti-revoke is on we force
+// the hook to report handled (return 1 + zero the caller's out-byte) so the raw
+// XML is consumed like vanilla WeChat, without touching the preserved bubble.
+extern volatile uint64_t g_RevokeConsumeOverrides;
 extern volatile uint64_t g_AutoReplyQueued;
 extern volatile uint64_t g_AutoReplySent;
 extern volatile uint64_t g_AutoReplyFailed;
@@ -339,6 +379,7 @@ struct SqliteBindTrace {
     uint64_t caller;
     char api[16];
     char text[512];
+    char sql[1024];
 };
 inline constexpr size_t kSqliteBindTraceCapacity = 128;
 extern SqliteBindTrace g_SqliteBindTraces[kSqliteBindTraceCapacity];
@@ -569,6 +610,20 @@ namespace offset
     inline constexpr uint64_t appmsg_holder_write = 0x5DA760;
     inline constexpr uint64_t appmsg_holder_size  = 0x5DA7D0;
     inline constexpr uint64_t appmsg_holder_data  = 0x5DA7A0;
+
+    // Native "insert local system message into a conversation" primitive
+    // (sub_184C280B0): builds
+    //   <?xml version="1.0"?>\n<sysmsg type="paymsg"><content>
+    //     <![CDATA[<arg3>]]></content></sysmsg>
+    // constructs a 728-byte local message object (type 10000 via
+    // sub_180A1B1B0), stamps the talker via sub_180A1AB20, and inserts it into
+    // the conversation through sub_18173DA00.  Signature (verified by
+    // decompile; a1 is unused in the body):
+    //   sub_184C280B0(void* /*unused*/, WeixinString* talker, WeixinString* content)
+    // Both talker and content are WeixinString (16-byte SSO buffer, then
+    // length @+0x10 / capacity @+0x18; heap when length >= 0x10).  Used by the
+    // experimental recall-tip injection (WeixinSend::InsertLocalSysTip).
+    inline constexpr uint64_t revoke_tip_insert = 0x4C280B0;
 }
 
 

@@ -176,6 +176,22 @@ void Route_QueryDB(httplib::Server& svr)
         resp["SyncBatchFromUsername"] = std::string(g_SyncBatchFromUsername);
         resp["SyncBatchToUsername"] = std::string(g_SyncBatchToUsername);
         resp["SyncBatchContent"] = std::string(g_SyncBatchContent);
+        resp["RevokeDetectedCount"] = g_RevokeDetectedCount;
+        resp["RevokePostedCount"] = g_RevokePostedCount;
+        resp["RevokeLastNewMsgId"] = g_RevokeLastNewMsgId;
+        resp["RevokeLastFrom"] = std::string(g_RevokeLastFrom);
+        resp["RevokeLastSender"] = std::string(g_RevokeLastSender);
+        resp["RevokeLastTip"] = std::string(g_RevokeLastTip);
+        resp["RevokeLastTalker"] = std::string(g_RevokeLastTalker);
+        resp["RevokeLastRevokeTime"] = g_RevokeLastRevokeTime;
+        resp["RevokeDistinctCount"] = g_RevokeDistinctCount;
+        resp["RevokeSuppressedCount"] = g_RevokeSuppressedCount;
+        resp["AntiRevokeEnabled"] = g_AntiRevokeEnabled != 0;
+        resp["RevokeTipInjectEnabled"] = g_RevokeTipInjectEnabled != 0;
+        resp["RevokeTipInjectCalls"] = g_RevokeTipInjectCalls;
+        resp["RevokeTipInjectOk"] = g_RevokeTipInjectOk;
+        resp["RevokeTipInjectFail"] = g_RevokeTipInjectFail;
+        resp["RevokeConsumeOverrides"] = g_RevokeConsumeOverrides;
         resp["AutoReplyQueued"] = g_AutoReplyQueued;
         resp["AutoReplySent"] = g_AutoReplySent;
         resp["AutoReplyFailed"] = g_AutoReplyFailed;
@@ -380,7 +396,8 @@ void Route_QueryDB(httplib::Server& svr)
                 {"index", item.index},
                 {"caller", item.caller},
                 {"api", std::string(item.api)},
-                {"text", std::string(item.text)}
+                {"text", std::string(item.text)},
+                {"sql", std::string(item.sql)}
             });
         }
         resp["MessageParserCalls"] = g_MessageParserCalls;

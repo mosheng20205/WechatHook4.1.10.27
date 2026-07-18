@@ -21,4 +21,16 @@ namespace WeixinSend
     // manager for the current login.  type defaults to 5 (link appmsg).
     bool SendAppMsg(const std::string& to_wxid, const std::string& xml,
                     uint64_t type);
+
+    // Experimental: insert a LOCAL system-tip message (e.g. the recall notice
+    // "<name> 撤回了一条消息") into the conversation `talker` via the native
+    // local-sysmsg inserter (offset::revoke_tip_insert / sub_184C280B0).  This
+    // does NOT touch the network -- it only writes a local message + refreshes
+    // the UI, so it is used to add the recall notice on top of an anti-revoke
+    // preserved bubble.  Must be called from a worker thread (never inside a
+    // receive hook).  SEH-guarded: a layout/type mismatch faults inside Weixin
+    // and is translated to false rather than terminating the host.  NOTE: the
+    // native inserter hard-codes sysmsg type="paymsg", so the rendered result
+    // is UNVERIFIED until confirmed on a real client.
+    bool InsertLocalSysTip(const std::string& talker, const std::string& text);
 }

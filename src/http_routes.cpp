@@ -218,4 +218,82 @@ void RegisterRoutes(httplib::Server& svr)
         res.set_header("Content-Type", "application/json; charset=utf-8");
         res.set_content(response.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json; charset=utf-8");
     });
+
+    // True anti-revoke: patch the revoke-apply branch in sub_1822D07C0 so recalled
+    // messages (text AND image) stay visible in the Weixin UI/store.  Default OFF,
+    // runtime-toggleable, byte-verified and reversible.
+    //   GET  /AntiRevoke/config -> {"enabled":bool}
+    //   POST /AntiRevoke/config with {"enabled":true|false}
+    svr.Get("/AntiRevoke/config", [](const httplib::Request&, httplib::Response& res)
+    {
+        using json = nlohmann::json;
+        json response;
+        response["ret"] = 0;
+        response["enabled"] = g_AntiRevokeEnabled != 0;
+        res.set_header("Content-Type", "application/json; charset=utf-8");
+        res.set_content(response.dump(), "application/json; charset=utf-8");
+    });
+
+    svr.Post("/AntiRevoke/config", [](const httplib::Request& req, httplib::Response& res)
+    {
+        using json = nlohmann::json;
+        res.set_header("Content-Type", "application/json; charset=utf-8");
+        json response;
+        bool enable = false;
+        try {
+            json body = json::parse(req.body);
+            enable = body.value("enabled", false);
+        } catch (...) {
+            response["ret"] = -1;
+            response["msg"] = "invalid json";
+            res.set_content(response.dump(), "application/json; charset=utf-8");
+            return;
+        }
+        const bool ok = enable ? AntiRevoke_Enable() : AntiRevoke_Disable();
+        response["ret"] = ok ? 0 : -1;
+        response["enabled"] = g_AntiRevokeEnabled != 0;
+        if (!ok)
+            response["msg"] = "patch site not in expected state (module not loaded or bytes shifted)";
+        res.set_content(response.dump(), "application/json; charset=utf-8");
+    });
+
+    // Experimental recall-tip injection.  When anti-revoke keeps the recalled
+    // bubble visible, this ALSO inserts a local "<name> 撤回了一条消息" notice
+    // into the same conversation via the native local-sysmsg inserter
+    // (sub_184C280B0).  Default OFF; on-screen rendering is UNVERIFIED because
+    // the native inserter hard-codes sysmsg type="paymsg".  Requires
+    // /AntiRevoke/config enabled to have any visible effect.
+    //   GET  /RevokeTip/config -> {"enabled":bool}
+    //   POST /RevokeTip/config with {"enabled":true|false}
+    svr.Get("/RevokeTip/config", [](const httplib::Request&, httplib::Response& res)
+    {
+        using json = nlohmann::json;
+        json response;
+        response["ret"] = 0;
+        response["enabled"] = g_RevokeTipInjectEnabled != 0;
+        res.set_header("Content-Type", "application/json; charset=utf-8");
+        res.set_content(response.dump(), "application/json; charset=utf-8");
+    });
+    svr.Post("/RevokeTip/config", [](const httplib::Request& req, httplib::Response& res)
+    {
+        using json = nlohmann::json;
+        res.set_header("Content-Type", "application/json; charset=utf-8");
+        json response;
+        bool enable = false;
+        try {
+            json body = json::parse(req.body);
+            enable = body.value("enabled", false);
+        } catch (...) {
+            response["ret"] = -1;
+            response["msg"] = "invalid json";
+            res.set_content(response.dump(), "application/json; charset=utf-8");
+            return;
+        }
+        InterlockedExchange(&g_RevokeTipInjectEnabled, enable ? 1 : 0);
+        response["ret"] = 0;
+        response["enabled"] = g_RevokeTipInjectEnabled != 0;
+        if (enable && g_AntiRevokeEnabled == 0)
+            response["msg"] = "enabled, but /AntiRevoke/config is OFF so there is no kept recall to annotate";
+        res.set_content(response.dump(), "application/json; charset=utf-8");
+    });
 }

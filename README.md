@@ -15,6 +15,7 @@
 - `/SendTextMsg`：完成登录保护、发送请求入队和异步发送。
 - `/ForwardXMLMsg`：appmsg/XML 链接卡片**真实发送**，已经真实微信进程端到端验证（服务器返回 `ret = 0`，卡片在对话中可见）。
 - 好友和群聊自动回复：均已完成真实消息端到端验证。
+- 防撤回 + 撤回灰条提示：撤回后原消息（文本 **AND** 图片）仍可见，并可额外显示`「xxx 撤回了一条消息」`灰条，默认关闭、运行时开关门控。
 - `/QueryDB/status`：返回登录状态、消息观察、联系人和自动回复诊断计数。
 - `/QueryDB/GetAllDBName`：返回 SQLite Hook 捕获的联系人数据库，不扫描进程内存。
 
@@ -49,6 +50,10 @@ GET  http://127.0.0.1:30001/AutoReply/config
 POST http://127.0.0.1:30001/AutoReply/config
 GET  http://127.0.0.1:30001/AutoReply/rules
 POST http://127.0.0.1:30001/AutoReply/rules
+GET  http://127.0.0.1:30001/AntiRevoke/config
+POST http://127.0.0.1:30001/AntiRevoke/config
+GET  http://127.0.0.1:30001/RevokeTip/config
+POST http://127.0.0.1:30001/RevokeTip/config
 POST http://127.0.0.1:30001/QueryDB/GetAllDBName
 POST http://127.0.0.1:30001/QueryDB/execute
 POST http://127.0.0.1:30001/SendImgMsg
@@ -156,6 +161,35 @@ Invoke-RestMethod `
 - native 调用均用 SEH 包裹；发送前校验登录状态与管理器已捕获。
 - 诊断计数（`/QueryDB/status`）：`AppMsgSendCalls`、`AppMsgDispatchOk/Fail`、`AppMsgLastRet`（`0` 为服务器接受）。
 
+### 防撤回 + 撤回灰条提示
+
+开启后，撤回的消息（文本 **AND** 图片）会留在会话中可见；再开启灰条提示，会在同一会话额外插入`「xxx 撤回了一条消息」`本地灰条。两者默认关闭、运行时开关门控。
+
+```powershell
+# 1) 开启防撤回（保留被撤回的原消息）
+Invoke-RestMethod `
+  -Uri 'http://127.0.0.1:30001/AntiRevoke/config' `
+  -Method Post `
+  -ContentType 'application/json' `
+  -Body '{"enabled":true}'
+
+# 2) 额外开启撤回灰条提示（需先开启防撤回）
+Invoke-RestMethod `
+  -Uri 'http://127.0.0.1:30001/RevokeTip/config' `
+  -Method Post `
+  -ContentType 'application/json' `
+  -Body '{"enabled":true}'
+```
+
+实现要点：
+
+- 防撤回以字节补丁（`0F 84` -> `90 E9`，`module + 0x22D09E7`）跳过 `sub_1822D07C0` 的撤回-应用分支，字节级校验、可逆；文本与图片一致生效。
+- 灰条通过微信原生本地系统消息插入原语（`sub_184C280B0`）在 Hook 消息处理线程**同步**插入，线程亲和正确；native 调用 SEH 包裹。
+- 防撤回会使 sysmsg 解析器返回「未处理」，导致原始 `<sysmsg>` XML 泄漏到临时「微信用户」会话；已在 Hook 内把 revokemsg 标记为「已消费」消除该泄漏，且不影响已保留的原消息气泡。
+- 诊断计数（`/QueryDB/status`）：`AntiRevokeEnabled`、`RevokeTipInjectOk/Fail`、`RevokeConsumeOverrides`、`RevokeDistinctCount`。
+
+详细逆向结论与真机验证记录见 [docs/ANTI_REVOKE_NOTES_4.1.10.27.md](docs/ANTI_REVOKE_NOTES_4.1.10.27.md)。
+
 ### 数据库接口
 
 微信 4.1.10.27 的联系人数据库路径为 `db_storage\contact\contact.db`。Hook 同时兼容旧逻辑名 `MicroMsg.db`，并明确排除 `contact_fts.db`。
@@ -193,6 +227,7 @@ powershell -ExecutionPolicy Bypass -File .\tools\test-api.ps1 -RequireLogin
 - [发送消息](docs/SEND_MESSAGE_NOTES_4.1.10.27.md)
 - [XML 卡片发送](docs/SEND_XML_NOTES_4.1.10.27.md)
 - [图片解密](docs/DECODE_PIC_NOTES_4.1.10.27.md)
+- [防撤回 + 撤回灰条提示](docs/ANTI_REVOKE_NOTES_4.1.10.27.md)
 
 ## 安全约束
 
