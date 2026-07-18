@@ -1,0 +1,10 @@
+#pragma once
+
+#define IDI_APP_ICON 101
+
+#define IDC_EDIT_PATH 1001
+#define IDC_BUTTON_BROWSE 1002
+#define IDC_EDIT_COUNT 1003
+#define IDC_BUTTON_NORMAL 1004
+#define IDC_BUTTON_FORCE 1005
+
